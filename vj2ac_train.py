@@ -38,20 +38,14 @@ class VJEPATrainer:
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.device = device
-        self.num_frames = OBSERVATIONS_PER_WINDOW # 16
+        self.num_frames = OBSERVATIONS_PER_WINDOW
         self.num_workers = num_workers
         self.rollout_horizon = ROLLOUT_HORIZON
         
-        self.encoder = VJEPA2Wrapper(num_frames=self.num_frames).to(device)
-        maybe_encoder = self.encoder if unfreeze_encoder else None
-        # Freeze the encoder
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        self.encoder = None
+        self.target_encoder = None
+
         self.predictor = VJ2GUIPredictor(num_frames=self.num_frames).to(device)
-        if unfreeze_encoder:
-            self.target_encoder = copy.deepcopy(self.encoder)
-        else:
-            self.target_encoder = self.encoder
         self.scaler = GradScaler()
         
         self.unsupervised_loader, self.unsupervised_sampler = init_preprocessed_data_loader(
@@ -61,8 +55,9 @@ class VJEPATrainer:
         )
         self.ipe = len(self.unsupervised_loader)
         
+        # Optimizer only handles the predictor. TODO: remove encoder stuff
         self.optimizer, self.scheduler, self.wd_scheduler = init_opt(
-            encoder = maybe_encoder,
+            encoder = None,
             predictor = self.predictor,
             iterations_per_epoch = self.ipe,
             start_lr  = 0.000075,
@@ -71,10 +66,6 @@ class VJEPATrainer:
             anneal = 15,
             num_epochs = num_epochs
         )
-        #for GPU multiprocessing
-        # self.encoder = DistributedDataParallel(self.encoder, static_graph=True)
-        # self.predictor = DistributedDataParallel(self.predictor, static_graph=False, find_unused_parameters=True)
-        # self.target_encoder = DistributedDataParallel(self.target_encoder)
         self.crop_size = 256
         self.patch_size = 16
         self.tokens_per_frame = int((self.crop_size // self.patch_size) ** 2)
@@ -107,11 +98,8 @@ class VJEPATrainer:
                 tokens_frame = self.tokens_per_frame,
             ),
         )
-        wandb_models_to_watch = [self.predictor]
-        if unfreeze_encoder:
-            wandb_models_to_watch.append(self.encoder)
         wandb.watch(
-            tuple(wandb_models_to_watch),
+            self.predictor,
             log="gradients",
             log_freq=100,
         )
@@ -125,11 +113,9 @@ class VJEPATrainer:
         ckpt = {
             "epoch":     epoch,
             "loss":      loss,
-            "encoder":   self.encoder.state_dict(),
             "predictor": self.predictor.state_dict(),
             "opt":       self.optimizer.state_dict(),
         }
-        # add schedulers only if they implement state_dict()
         if hasattr(self.scheduler, "state_dict"):
             ckpt["sched"] = self.scheduler.state_dict()
         if hasattr(self.wd_scheduler, "state_dict"):
@@ -157,7 +143,6 @@ class VJEPATrainer:
 
     def _load_checkpoint(self, checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=self.device)
-        self.encoder.load_state_dict(ckpt["encoder"])
         self.predictor.load_state_dict(ckpt["predictor"])
         self.optimizer.load_state_dict(ckpt["opt"])
         if "sched" in ckpt and hasattr(self.scheduler, "load_state_dict"):
@@ -175,7 +160,7 @@ class VJEPATrainer:
             self.unsupervised_sampler.set_epoch(self.start_epoch)
         
         for epoch in range(self.start_epoch, self.start_epoch + self.num_epochs):
-            self.current_epoch = epoch # Update current epoch
+            self.current_epoch = epoch
             loss_meter = AverageMeter()
             jloss_meter = AverageMeter()
             sloss_meter = AverageMeter()
@@ -212,7 +197,7 @@ class VJEPATrainer:
                 )
 
             epoch_loss = loss_meter.avg
-            self.current_loss = epoch_loss # Update current loss
+            self.current_loss = epoch_loss
             print(f"--- Epoch {epoch+1} Summary --- Loss: {epoch_loss:.4f} ---")
 
             # always save the last epoch
@@ -229,47 +214,31 @@ class VJEPATrainer:
     
     def load_trajectory(self, sample):
         """Loads and prepares a single training trajectory."""
-        observations, actions = sample
+        embeddings, actions = sample
         
-        observations = observations.to(self.device, non_blocking=True)
+        embeddings = embeddings.to(self.device, non_blocking=True)
         actions = actions.to(self.device, dtype=torch.float, non_blocking=True)
         
-        return observations, actions
+        return embeddings, actions
 
     def train_step(self, sample):
         _new_lr = self.scheduler.step()
         _new_wd = self.wd_scheduler.step()
         
-        observations, actions = self.load_trajectory(sample)
-        B, O, C, H, W = observations.shape # B=batch, O=observations
+        embeddings, actions = self.load_trajectory(sample)
+        z_all = embeddings
+        h_all = embeddings
         
         self.optimizer.zero_grad()
         with autocast():
-            # --- Encode Observations to Latent States ---
-            # The VJEPA2Wrapper encoder internally handles the creation of latent
-            # states from the sequence of observations (e.g., 16 -> 8).
-            with torch.no_grad():
-                h_all = self.target_encoder(observations)
-                h_all = F.layer_norm(h_all, (h_all.size(-1),))
-
-            # Also encode with the online encoder
-            z_all = self.encoder(observations)
-
-            # --- Make Predictions ---
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
 
-            # --- Targets for Loss Calculation ---
-            # Teacher-forced targets are z_1, ..., z_7
-            h_tf_targets = h_all[:, 1:]
+            h_tf_targets = h_all[:, 1:]  # teacher-forced targets z_1, ..., z_7
             
-            # Rollout target is z_2 (or z_{rollout_horizon})
-            h_rollout_target = h_all[:, self.rollout_horizon]
+            h_rollout_target = h_all[:, self.rollout_horizon]  # rollout target is z_{rollout_horizon}
 
-            # --- Calculate Losses ---
-            # Teacher-forcing loss over the whole trajectory
             jloss = self.loss_fn(z_tf, h_tf_targets)
             
-            # Rollout loss on the final predicted state of the rollout
             sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_rollout_target.unsqueeze(1))
             
             loss = jloss + sloss
@@ -292,25 +261,17 @@ class VJEPATrainer:
         Performs both teacher-forced and autoregressive predictions based on
         the full sequence of latent states.
         """
-        # --- Teacher-Forced Prediction ---
-        # Predict z_{t+1} from z_t and a_t for all t=0..6
-        # Input latents: z_0, ..., z_6. Input actions: a_0, ..., a_6
-        # Flatten actions for the predictor
-        # actions: [B, T_seq, ACTIONS_PER_BATCH, ACTION_DIM] -> [B, T_seq, ACTIONS_PER_BATCH * ACTION_DIM]
         B, T_seq, _, _ = actions.shape
-        actions_flat = actions.view(B, T_seq, -1)
+        actions_flat = actions.view(B, T_seq, -1)  # [B, T_seq, ACTIONS_PER_BATCH, ACTION_DIM] -> [B, T_seq, ACTIONS_PER_BATCH * ACTION_DIM]
 
         z_tf = self._step_predictor(z_all[:, :-1], actions_flat)
 
-        # --- Autoregressive Rollout ---
-        # As per formalisation, rollout is T_R=2 steps for loss calculation
-        z_rollout_current = z_all[:, 0].unsqueeze(1) # Start with z_0
+        z_rollout_current = z_all[:, 0].unsqueeze(1)
         for i in range(self.rollout_horizon):
             action_current = actions_flat[:, i].unsqueeze(1)
             z_rollout_next = self._step_predictor(z_rollout_current, action_current)
             z_rollout_current = z_rollout_next
         
-        # The final prediction of the rollout
         z_ar_final = z_rollout_current.squeeze(1)
 
         return z_tf, z_ar_final
@@ -337,10 +298,9 @@ class VJEPATrainer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train VJ2-GUI Agent")
-    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs to run during the training session.")  # try 100
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")  # try 32
+    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs to run during the training session.")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of worker processes for data loading.")
-    parser.add_argument('--unfreeze_encoder', action='store_true', help="Unfreezes encoder.")
     parser.add_argument('--log', default='info', choices=['debug', 'info', 'warning', 'error', 'critical'])
     parser.add_argument(
         "--processed_data_dir",
@@ -362,7 +322,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         processed_data_dir=args.processed_data_dir,
-        unfreeze_encoder=args.unfreeze_encoder,
+        unfreeze_encoder=False,
         checkpoint_path=args.load_checkpoint
     )
     trainer.training_loop()
