@@ -1,0 +1,6 @@
+name: vjepa2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+prefix: /opt/homebrew/Caskroom/miniforge/base/envs/vjepa2
