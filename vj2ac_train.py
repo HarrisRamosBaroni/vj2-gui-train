@@ -34,13 +34,14 @@ import signal
 logger = logging.getLogger()
  
 class VJEPATrainer:
-    def __init__(self, num_epochs, batch_size, num_workers, processed_data_dir, unfreeze_encoder, checkpoint_path=None, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, num_epochs, batch_size, num_workers, processed_data_dir, validation_data_dir, save_every_epochs, unfreeze_encoder, checkpoint_path=None, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.device = device
         self.num_frames = OBSERVATIONS_PER_WINDOW
         self.num_workers = num_workers
         self.rollout_horizon = ROLLOUT_HORIZON
+        self.save_every_epochs = save_every_epochs
         
         self.encoder = None
         self.target_encoder = None
@@ -54,6 +55,14 @@ class VJEPATrainer:
             num_workers=self.num_workers
         )
         self.ipe = len(self.unsupervised_loader)
+        
+        self.validation_loader = None
+        if validation_data_dir:
+            self.validation_loader, _ = init_preprocessed_data_loader(
+                processed_data_dir=validation_data_dir,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers
+            )
         
         # Optimizer only handles the predictor. TODO: remove encoder stuff
         self.optimizer, self.scheduler, self.wd_scheduler = init_opt(
@@ -186,9 +195,9 @@ class VJEPATrainer:
                 wandb.log(
                     {
                         "iter": epoch * len(loader) + itr,
-                        "loss": loss,
-                        "jloss": jloss,
-                        "sloss": sloss,
+                        "train/loss": loss,
+                        "train/jloss": jloss,
+                        "train/sloss": sloss,
                         "lr": _new_lr,
                         "wd": _new_wd,
                         "epoch": epoch + 1,
@@ -198,20 +207,67 @@ class VJEPATrainer:
 
             epoch_loss = loss_meter.avg
             self.current_loss = epoch_loss
-            print(f"--- Epoch {epoch+1} Summary --- Loss: {epoch_loss:.4f} ---")
+            
+            val_loss, val_jloss, val_sloss = -1, -1, -1
+            if self.validation_loader:
+                val_loss, val_jloss, val_sloss = self.validate_epoch()
+                print(f"--- Epoch {epoch+1} Summary --- Train Loss: {epoch_loss:.4f} --- Val Loss: {val_loss:.4f}")
+                wandb.log({
+                    "val/loss": val_loss,
+                    "val/jloss": val_jloss,
+                    "val/sloss": val_sloss,
+                }, step=epoch * len(loader) + len(loader) - 1)
+            else:
+                print(f"--- Epoch {epoch+1} Summary --- Train Loss: {epoch_loss:.4f} ---")
 
-            # always save the last epoch
             self._save_checkpoint("last", epoch, epoch_loss)
 
-            # save best model so far
-            if epoch_loss < self.best_loss:
-                self.best_loss = epoch_loss
-                self._save_checkpoint("best", epoch, epoch_loss)
-                logger.info(f"🎉 New best loss {epoch_loss:.4f} at epoch {epoch+1}")
-        
+            if self.validation_loader and val_loss < self.best_loss:
+                self.best_loss = val_loss
+                self._save_checkpoint("best", epoch, val_loss)
+                logger.info(f" New best validation loss {val_loss:.4f} at epoch {epoch+1}!")
+
+            if self.save_every_epochs > 0 and (epoch + 1) % self.save_every_epochs == 0:
+                self._save_checkpoint(f"epoch_{epoch+1}", epoch, epoch_loss)
+
         wandb.finish()
 
     
+    def validate_epoch(self):
+        self.predictor.eval()
+        loss_meter = AverageMeter()
+        jloss_meter = AverageMeter()
+        sloss_meter = AverageMeter()
+
+        loader = iter(self.validation_loader)
+        for itr, sample in enumerate(loader):
+            loss, jloss, sloss = self.validation_step(sample)
+            loss_meter.update(loss)
+            jloss_meter.update(jloss)
+            sloss_meter.update(sloss)
+        
+        self.predictor.train()
+        return loss_meter.avg, jloss_meter.avg, sloss_meter.avg
+
+    @torch.no_grad()
+    def validation_step(self, sample):
+        embeddings, actions = self.load_trajectory(sample)
+        z_all = embeddings
+        h_all = embeddings
+        
+        with autocast():
+            z_tf, z_ar_final = self.forward_predictions(z_all, actions)
+
+            h_tf_targets = h_all[:, 1:]
+            h_rollout_target = h_all[:, self.rollout_horizon]
+
+            jloss = self.loss_fn(z_tf, h_tf_targets)
+            sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_rollout_target.unsqueeze(1))
+            
+            loss = jloss + sloss
+        
+        return float(loss), float(jloss), float(sloss)
+
     def load_trajectory(self, sample):
         """Loads and prepares a single training trajectory."""
         embeddings, actions = sample
@@ -314,23 +370,29 @@ if __name__ == "__main__":
         default=None,
         help="Path to a checkpoint file to resume training from."
     )
+    parser.add_argument(
+        "--validation_data_dir",
+        type=str,
+        default=None,
+        help="Directory containing the pre-processed validation .npz files."
+    )
+    parser.add_argument(
+        "--save_every_epochs",
+        type=int,
+        default=0,
+        help="Save a checkpoint every this many epochs. 0 to disable."
+    )
     args = parser.parse_args()
-    logging.basicConfig(level=getattr(logging, args.log.upper()))    
+    logging.basicConfig(level=getattr(logging, args.log.upper()))
 
     trainer = VJEPATrainer(
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         processed_data_dir=args.processed_data_dir,
+        validation_data_dir=args.validation_data_dir,
+        save_every_epochs=args.save_every_epochs,
         unfreeze_encoder=False,
         checkpoint_path=args.load_checkpoint
     )
     trainer.training_loop()
-
-        
-        
-
-
-        
-        
-    
