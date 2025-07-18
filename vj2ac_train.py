@@ -252,8 +252,8 @@ class VJEPATrainer:
     @torch.no_grad()
     def validation_step(self, sample):
         embeddings, actions = self.load_trajectory(sample)
-        z_all = embeddings
-        h_all = embeddings
+        z_all = F.layer_norm(embeddings, (embeddings.size(-1),))
+        h_all = z_all
         
         with autocast():
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
@@ -282,8 +282,8 @@ class VJEPATrainer:
         _new_wd = self.wd_scheduler.step()
         
         embeddings, actions = self.load_trajectory(sample)
-        z_all = embeddings
-        h_all = embeddings
+        z_all = F.layer_norm(embeddings, (embeddings.size(-1),))
+        h_all = z_all
         
         self.optimizer.zero_grad()
         with autocast():
@@ -354,34 +354,14 @@ class VJEPATrainer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train VJ2-GUI Agent")
-    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs to run during the training session.")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training.")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of worker processes for data loading.")
-    parser.add_argument('--log', default='info', choices=['debug', 'info', 'warning', 'error', 'critical'])
-    parser.add_argument(
-        "--processed_data_dir",
-        type=str,
-        default="./processed_data",
-        help="Directory containing the pre-processed .npz files."
-    )
-    parser.add_argument(
-        "--load_checkpoint",
-        type=str,
-        default=None,
-        help="Path to a checkpoint file to resume training from."
-    )
-    parser.add_argument(
-        "--validation_data_dir",
-        type=str,
-        default=None,
-        help="Directory containing the pre-processed validation .npz files."
-    )
-    parser.add_argument(
-        "--save_every_epochs",
-        type=int,
-        default=0,
-        help="Save a checkpoint every this many epochs. 0 to disable."
-    )
+    parser.add_argument("-e", "--num_epochs", type=int, default=1, help="Number of training epochs to run during the training session. Default: 1")
+    parser.add_argument("-b", "--batch_size", type=int, default=4, help="Batch size for training. Default: 4")
+    parser.add_argument("-w", "--num_workers", type=int, default=1, help="Number of worker processes for data loading. Default: 1")
+    parser.add_argument("-l", '--log', default='info', choices=['debug', 'info', 'warning', 'error', 'critical'])
+    parser.add_argument("-t", "--processed_data_dir", type=str, required=True, help="Directory containing the pre-processed training .npz files. Required.")
+    parser.add_argument("-c", "--load_checkpoint", type=str, default=None, help="Path to a checkpoint file to resume training from.")
+    parser.add_argument("-v", "--validation_data_dir", type=str, required=True, help="Directory containing the pre-processed validation .npz files. Required.")
+    parser.add_argument("-s", "--save_every_epochs", type=int, default=0, help="Save a checkpoint every this many epochs. 0 to disable. Default: 0")
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log.upper()))
 
