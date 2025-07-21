@@ -6,6 +6,8 @@ Training instructions:
 `export WANDB_API_KEY=<your_api_key>`  # (will supply through whatsapp or email upon request)
 `pip install wandb`
 `wandb login`
+- Must have `torch`. Other dependencies:
+`pip install timm einops`
 - run training:
 `python vj2ac_train --num_epochs 30 --batch_size 32 --num_workers 12 -t ./Train -v ./Validate --save_every_epochs 1`
 - (model is small about 1GB so every epoch save is fine).

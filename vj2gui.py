@@ -34,12 +34,20 @@ class VJEPA2Wrapper(nn.Module):
         self.encoder = self.encoder.to(device).eval()
 
         # Preprocessing: [H,W,C] -> [C,H,W], normalized to [0,1]
+        # ImageNet normalization values
+        normalize_mean = [0.485, 0.456, 0.406]
+        normalize_std = [0.229, 0.224, 0.225]
         self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
-            T.CenterCrop(image_size),
+            T.Resize((self.image_size, self.image_size), interpolation=T.InterpolationMode.BICUBIC),
             T.ToTensor(),
+            T.Normalize(mean=normalize_mean, std=normalize_std)
         ])
+        # self.transform = T.Compose([
+        #     T.ToPILImage(),
+        #     T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
+        #     T.CenterCrop(image_size), # MIGHT NEED TO CHANGE
+        #     T.ToTensor(),
+        # ])
 
     def forward(self, x: torch.Tensor):
         """
