@@ -7,7 +7,7 @@ Training instructions:
 `pip install wandb`
 `wandb login`
 - Must have `torch`. Other dependencies:
-`pip install timm einops`
+`pip install timm einops opencv-python`
 - run training:
 `python vj2ac_train.py --num_epochs 30 --batch_size 32 --num_workers 12 -t ./Train -v ./Validate --save_every_epochs 1`
 - (model is small about 1GB so every epoch save is fine).
