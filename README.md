@@ -9,6 +9,6 @@ Training instructions:
 - Must have `torch`. Other dependencies:
 `pip install timm einops`
 - run training:
-`python vj2ac_train --num_epochs 30 --batch_size 32 --num_workers 12 -t ./Train -v ./Validate --save_every_epochs 1`
+`python vj2ac_train.py --num_epochs 30 --batch_size 32 --num_workers 12 -t ./Train -v ./Validate --save_every_epochs 1`
 - (model is small about 1GB so every epoch save is fine).
 - You may increase batch size depending on the GPU constrants. Adjust `num_workers` as appropriate. Safe to control+c any time.
