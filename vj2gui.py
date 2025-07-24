@@ -38,10 +38,16 @@ class VJEPA2Wrapper(nn.Module):
         normalize_mean = [0.485, 0.456, 0.406]
         normalize_std = [0.229, 0.224, 0.225]
         self.transform = T.Compose([
+            T.ToPILImage(),
             T.Resize((self.image_size, self.image_size), interpolation=T.InterpolationMode.BICUBIC),
             T.ToTensor(),
             T.Normalize(mean=normalize_mean, std=normalize_std)
         ])
+        # self.transform = T.Compose([
+        #     T.Resize((self.image_size, self.image_size), interpolation=T.InterpolationMode.BICUBIC),
+        #     T.ToTensor(),
+        #     T.Normalize(mean=normalize_mean, std=normalize_std)
+        # ])
         # self.transform = T.Compose([
         #     T.ToPILImage(),
         #     T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
