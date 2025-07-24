@@ -23,7 +23,7 @@ from config import ROLLOUT_HORIZON, ACTION_BLOCKS_PER_WINDOW, OBSERVATIONS_PER_W
 from vj2gui_utils import init_opt
 
 from vj2gui_predictor import VJ2GUIPredictor
-from vj2gui import VJEPA2Wrapper
+# from vj2gui import VJEPA2Wrapper
 import os
 import logging
 import wandb
