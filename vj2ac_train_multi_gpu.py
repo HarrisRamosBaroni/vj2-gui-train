@@ -1,30 +1,21 @@
-import math
-from functools import partial
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as T
-import numpy as np
-import copy
 from pathlib import Path
 from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
-import logging
 import wandb
 import time
 import argparse
 import signal
 
-from src.models.utils.modules import ACBlock as Block
-from src.models.utils.modules import build_action_block_causal_attention_mask
-from src.utils.tensors import trunc_normal_
-from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
 from vj2_dataloader import init_preprocessed_data_loader
-from config import ROLLOUT_HORIZON, ACTION_BLOCKS_PER_WINDOW, OBSERVATIONS_PER_WINDOW
+from config import ROLLOUT_HORIZON, OBSERVATIONS_PER_WINDOW
+from src.utils.logging import AverageMeter, get_logger
 from vj2gui_utils import init_opt
 from vj2gui_predictor import VJ2GUIPredictor
+from testing.model_info import analyze_my_model
 
 logger = get_logger()
 
@@ -40,8 +31,11 @@ class VJEPATrainer:
         self.rollout_horizon = ROLLOUT_HORIZON
         self.save_every_epochs = args.save_every_epochs
 
-        self.predictor = VJ2GUIPredictor(num_frames=self.num_frames).to(self.device)
+        self.predictor = VJ2GUIPredictor(num_frames=self.num_frames,depth=24).to(self.device)
         self.predictor = DDP(self.predictor, device_ids=[args.local_rank])
+
+        model_stats = analyze_my_model(self.predictor, verbose=True)
+
 
         self.scaler = GradScaler()
 
@@ -71,20 +65,22 @@ class VJEPATrainer:
             num_epochs=self.num_epochs
         )
 
-        self.crop_size = 256
-        self.patch_size = 16
-        self.tokens_per_frame = int((self.crop_size // self.patch_size) ** 2)
-        self.loss_exp = 1
+        self.crop_size = 256 # pixels
+        self.patch_size = 16 # pixels
+        self.tokens_per_frame = int((self.crop_size // self.patch_size) ** 2) # count
+        self.loss_exp = 1 # 1 for L1, 2 for L2
 
+        # Initializing loss
         self.start_epoch = 0
         self.best_loss = float("inf")
         self.current_epoch = 0
         self.current_loss = float("inf")
 
         self.run_dir = Path("checkpoints") / time.strftime("%Y%m%d_%H%M%S")
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.run_dir.mkdir(parents=True, exist_ok=True) # Create directory if it doesn't exists
 
         if dist.get_rank() == 0:
+            # Initialize Weights & Biases
             self.run = wandb.init(
                 project="vjepa2-ac",
                 name=f"run_{time.strftime('%Y%m%d_%H%M%S')}",
@@ -99,7 +95,7 @@ class VJEPATrainer:
                     tokens_frame=self.tokens_per_frame,
                 ),
             )
-            wandb.watch(self.predictor.module, log="gradients", log_freq=100)
+            wandb.watch(self.predictor.module, log="gradients", log_freq=50) # Log geradients
 
         signal.signal(signal.SIGINT, lambda signum, frame: self._save_interrupted_checkpoint())
 
@@ -150,6 +146,7 @@ class VJEPATrainer:
             loader = iter(self.unsupervised_loader)
             for itr, sample in enumerate(loader):
                 loss, jloss, sloss, lr, wd = self.train_step(sample)
+                # jlos: teacher forcing loss, sloss: rollout loss
 
                 loss_meter.update(loss)
                 jloss_meter.update(jloss)
@@ -166,17 +163,18 @@ class VJEPATrainer:
                         "epoch": epoch + 1,
                     })
 
-            self.current_loss = loss_meter.avg
 
-            if self.validation_loader:
-                val_loss, val_jloss, val_sloss = self.validate_epoch()
-                if dist.get_rank() == 0:
-                    wandb.log({
-                        "val/loss": val_loss,
-                        "val/jloss": val_jloss,
-                        "val/sloss": val_sloss,
-                    })
-            self._save_checkpoint("last", epoch, self.current_loss)
+                if itr % 100 == 0 and dist.get_rank() == 0:  # Log every 100 step
+                    if self.validation_loader:
+                        val_loss, val_jloss, val_sloss = self.validate_epoch()
+                        if dist.get_rank() == 0:
+                            wandb.log({
+                                "val/loss": val_loss,
+                                "val/jloss": val_jloss,
+                                "val/sloss": val_sloss,
+                            })
+                self._save_checkpoint("last", epoch, self.current_loss)
+            self.current_loss = loss_meter.avg
 
             if self.save_every_epochs > 0 and (epoch + 1) % self.save_every_epochs == 0:
                 self._save_checkpoint(f"epoch_{epoch+1}", epoch, self.current_loss)
@@ -185,7 +183,7 @@ class VJEPATrainer:
             wandb.finish()
 
     def validate_epoch(self):
-        self.predictor.eval()
+        self.predictor.eval() # remember to convert back to train later
         loss_meter, jloss_meter, sloss_meter = AverageMeter(), AverageMeter(), AverageMeter()
 
         loader = iter(self.validation_loader)
@@ -195,7 +193,7 @@ class VJEPATrainer:
             jloss_meter.update(jloss)
             sloss_meter.update(sloss)
 
-        self.predictor.train()
+        self.predictor.train() # convert back to train mode, we remembered :)
         return loss_meter.avg, jloss_meter.avg, sloss_meter.avg
 
     @torch.no_grad()
