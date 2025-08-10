@@ -254,10 +254,16 @@ if __name__ == "__main__":
     parser.add_argument("--processed_data_dir", type=str, required=True)
     parser.add_argument("--validation_data_dir", type=str, required=True)
     parser.add_argument("--save_every_epochs", type=int, default=0)
-    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--local_rank", type=int, default=-1)  # Changed default to -1
     args = parser.parse_args()
 
-    dist.init_process_group("nccl")
+    # Initialize process group using environment variables
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend="nccl", init_method='env://')
+    args.local_rank = int(os.environ["LOCAL_RANK"])
 
     trainer = VJEPATrainer(args)
     trainer.training_loop()
+
+    # Cleanup
+    dist.destroy_process_group()
