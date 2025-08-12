@@ -109,7 +109,16 @@ def init_preprocessed_data_loader(processed_data_dir: str, batch_size: int, num_
         sampler=sampler
     )
     
-    logger.info("Preprocessed GUI Agent data loader created.")
+    # DDP sanity prints
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        if rank == 0:
+            logger.info(f"[DDP] Dataloader created with {len(dataset)} samples, batch_size={batch_size}")
+            if sampler:
+                logger.info(f"[DDP] Using DistributedSampler with {world_size} ranks")
+    else:
+        logger.info("Preprocessed GUI Agent data loader created.")
     return data_loader, sampler
 
 # ---------------------------------------------------------------------------
