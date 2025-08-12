@@ -32,6 +32,7 @@ class PreprocessedGUIAgentDataset(Dataset):
         self.data_dir = Path(processed_data_dir)
         self.file_indices = []
         self.total_trajectories = 0
+        self._cached_data = {}
 
         data_files = sorted(self.data_dir.glob("*.npz"))
         if not data_files:
@@ -76,12 +77,19 @@ class PreprocessedGUIAgentDataset(Dataset):
         else:
             raise IndexError(f"Index {idx} out of bounds for dataset with {self.total_trajectories} trajectories.")
 
-        # Note: This opens the file for every __getitem__ call.
-        # For performance with many small files, consider pre-loading into memory
-        # if the dataset fits. For large datasets, this is fine.
-        with np.load(file_path) as data:
-            embeddings = data['embeddings'][local_idx]
-            actions = data['actions'][local_idx]
+        # In-memory array caching: To avoid repeated disk I/O and decompression,
+        # the entire 'embeddings' and 'actions' arrays are loaded into memory
+        # the first time a file is accessed by a worker.
+        file_path_str = str(file_path)
+        if file_path_str not in self._cached_data:
+            with np.load(file_path) as data:
+                # Load the entire arrays into the cache
+                self._cached_data[file_path_str] = (data['embeddings'], data['actions'])
+
+        # Retrieve arrays from cache and slice the specific trajectory
+        embeddings_array, actions_array = self._cached_data[file_path_str]
+        embeddings = embeddings_array[local_idx]
+        actions = actions_array[local_idx]
 
         return torch.from_numpy(embeddings).float(), torch.from_numpy(actions).float()
 
