@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
-import cv2
 import numpy as np
 
 import os
@@ -77,6 +76,7 @@ class VJEPA2Wrapper(nn.Module):
         Preprocess video: uniformly sample at `fps`, chunk into segments of `num_frames`.
         Returns: video batch tensor of shape [B, T, C, H, W] where T = self.num_frames
         """
+        import cv2
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
