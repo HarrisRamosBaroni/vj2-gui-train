@@ -11,11 +11,11 @@ import argparse
 import signal
 import datetime
 
-from vj2_dataloader import init_preprocessed_data_loader
+from training.dataloader import init_preprocessed_data_loader
 from config import ROLLOUT_HORIZON, OBSERVATIONS_PER_WINDOW
 from src.utils.logging import AverageMeter, get_logger
-from vj2gui_utils import init_opt
-from vj2gui_predictor import VJ2GUIPredictor
+from training.utils import init_opt
+from src.models.predictor import VJ2GUIPredictor
 from testing.model_info import analyze_my_model
 
 logger = get_logger()
