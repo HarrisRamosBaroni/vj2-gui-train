@@ -2,8 +2,13 @@
 
 ### Get dataset
 - Download or git clone this repo
-- The training dataset consists of Harri's google drive under `final_data/train` and place in an appropriate place such as is `./Train`
-- The training requires a separate directory for validation. This keeps consistency across sessions instead of a different random split each session. Download the `final_data/validate` folder from Harris' google drive and place into `./Validate`
+- The training dataset consists of Harris' google drive under `final_data/train` and place in an appropriate place such as is `./train`
+- The training requires a separate directory for validation to keeps consistency across sessions (instead of a different random split each session). Download the `final_data/validate` folder from Harris' google drive and place into `./validate`
+
+### Dataset Migration
+- run 
+`python -m training.migrate_npz_to_npy --input-dir ./train --output-dir ./Train --cleanup`
+`python -m training.migrate_npz_to_npy --input-dir ./validate --output-dir ./Validate --cleanup`
 
 ### Environment setup
 - Ensure you pip install wandb: 
@@ -14,5 +19,5 @@
 `pip install timm einops`
 
 ### Run training
-`python -m training.train_multi_gpu --num_epochs 30 --batch_size 32 --num_workers 12 --processed_data_dir ./Train --validation_data_dir ./Validate`
+`python -m training.train_multi_gpu --num_epochs 10 --batch_size 64 --num_workers 12 --processed_data_dir ./Train --validation_data_dir ./Validate`
 - You may increase batch size depending on the GPU constrants. Adjust `num_workers` as appropriate. Safe to control+c any time.
