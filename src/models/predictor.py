@@ -16,7 +16,7 @@ import numpy as np
 from src.models.utils.modules import ACBlock as Block
 from src.models.utils.modules import build_action_block_causal_attention_mask
 from src.utils.tensors import trunc_normal_
-from vj2gui import VJEPA2Wrapper
+from src.models.encoder import VJEPA2Wrapper
 
 from config import (
     ACTION_DIM,
