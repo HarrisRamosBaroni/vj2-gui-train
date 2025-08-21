@@ -19,5 +19,5 @@
 `pip install timm einops`
 
 ### Run training
-`python -m training.train_multi_gpu --num_epochs 10 --batch_size 64 --num_workers 12 --processed_data_dir ./Train --validation_data_dir ./Validate`
+`python -m training.train_multi_gpu --num_epochs 40 --batch_size 64 --num_workers 12 --processed_data_dir ./Train --validation_data_dir ./Validate --depth 48 --num_heads 25 --rollout_horizon 5`
 - You may increase batch size depending on the GPU constrants. Adjust `num_workers` as appropriate. Safe to control+c any time.
