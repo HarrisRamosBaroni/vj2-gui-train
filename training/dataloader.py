@@ -61,7 +61,8 @@ class PreprocessedGUIAgentDataset(Dataset):
         embeddings = np.load(emb_path, mmap_mode='r')
         actions = np.load(act_path, mmap_mode='r')
 
-        return torch.from_numpy(embeddings).float(), torch.from_numpy(actions).float()
+        # return torch.from_numpy(embeddings).float(), torch.from_numpy(actions).float()
+        return torch.from_numpy(embeddings.copy()).float(), torch.from_numpy(actions.copy()).float()
 
 # ---------------------------------------------------------------------------
 

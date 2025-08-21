@@ -10,20 +10,22 @@ import copy
 from pathlib import Path
 from torch.cuda.amp import autocast, GradScaler
 
-from src.models.utils.modules import ACBlock as Block
-from src.models.utils.modules import build_action_block_causal_attention_mask
+from src.vj2_models.utils.modules import ACBlock as Block
+from src.vj2_models.utils.modules import build_action_block_causal_attention_mask
 from src.utils.tensors import trunc_normal_
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
-from vj2_dataloader import init_preprocessed_data_loader
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from training.dataloader import init_preprocessed_data_loader
 from config import ROLLOUT_HORIZON, ACTION_BLOCKS_PER_WINDOW, OBSERVATIONS_PER_WINDOW
-
-from vj2gui_utils import init_opt
-
-from vj2gui_predictor import VJ2GUIPredictor
-from vj2gui import VJEPA2Wrapper
+from training.utils import init_opt
+from src.vj2_models.predictor import VJ2GUIPredictor
+from src.vj2_models.encoder import VJEPA2Wrapper
 import os
 import logging
 import wandb
@@ -208,6 +210,7 @@ class VJEPATrainer:
             epoch_loss = loss_meter.avg
             self.current_loss = epoch_loss
             
+            # ! SHIFT VALIDATION Logic into training loop, for every N steps.
             val_loss, val_jloss, val_sloss = -1, -1, -1
             if self.validation_loader:
                 val_loss, val_jloss, val_sloss = self.validate_epoch()

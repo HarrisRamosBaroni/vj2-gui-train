@@ -1,8 +1,11 @@
 
-# vj2gui_utils.py
+# training/utils.py
 
 import torch
 from torchvision import transforms
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.utils.schedulers import CosineWDSchedule, WSDSchedule
 
 # Matches V-JEPA2 training setup (256x256, normalized to [-1, 1])

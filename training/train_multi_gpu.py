@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 from pathlib import Path
-from torch.cuda.amp import autocast, GradScaler
+# from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
@@ -15,7 +16,7 @@ from training.dataloader import init_preprocessed_data_loader
 from config import ROLLOUT_HORIZON, OBSERVATIONS_PER_WINDOW
 from src.utils.logging import AverageMeter, get_logger
 from training.utils import init_opt
-from src.models.predictor import VJ2GUIPredictor
+from src.vj2_models.predictor import VJ2GUIPredictor
 from testing.model_info import analyze_my_model
 
 logger = get_logger()
@@ -29,6 +30,7 @@ def _ddp_mean(x: float, device) -> float:
 
 class VJEPATrainer:
     def __init__(self, args):
+        self.args = args
         if args.device_type == "cuda":
             self.device = torch.device(f"cuda:{args.local_rank}")
         else:
@@ -37,12 +39,14 @@ class VJEPATrainer:
         self.num_epochs = args.num_epochs
         self.batch_size = args.batch_size
         self.num_frames = OBSERVATIONS_PER_WINDOW
+        self.tubelet_size = 2
         self.num_workers = args.num_workers
-        self.rollout_horizon = ROLLOUT_HORIZON
+        self.rollout_horizon = args.rollout_horizon  # ROLLOUT_HORIZON
         self.save_every_epochs = args.save_every_epochs
         self.save_every_iters = args.save_every_iters
 
-        self.predictor = VJ2GUIPredictor(num_frames=self.num_frames,depth=24).to(self.device)
+        self.predictor = VJ2GUIPredictor(num_frames=self.num_frames, tubelet_size=self.tubelet_size, 
+                                         depth=args.depth, num_heads=args.num_heads).to(self.device)
         
         # DDP wrapper - only pass device_ids for CUDA
         if args.device_type == "cuda":
@@ -54,8 +58,7 @@ class VJEPATrainer:
         
         print(f"[DDP] Rank {dist.get_rank()}: Model initialized on {self.device}")
 
-
-        self.scaler = GradScaler()
+        self.scaler = GradScaler('cuda')
 
         self.unsupervised_loader, self.unsupervised_sampler = init_preprocessed_data_loader(
             processed_data_dir=args.processed_data_dir,
@@ -96,8 +99,18 @@ class VJEPATrainer:
         self.current_loss = float("inf")
         self.global_step = 0
 
-        self.run_dir = Path("checkpoints") / time.strftime("%Y%m%d_%H%M%S")
-        self.run_dir.mkdir(parents=True, exist_ok=True) # Create directory if it doesn't exists
+        # If a checkpoint was provided via args, try to resume from it.
+        if getattr(args, "load_checkpoint", None):
+            try:
+                self._load_checkpoint(args.load_checkpoint)
+            except Exception as e:
+                logger.error(f"❌ Error loading checkpoint {args.load_checkpoint}: {e}")
+                # fall back to a new run dir
+                self.run_dir = Path("checkpoints") / time.strftime("%Y%m%d_%H%M%S")
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.run_dir = Path("checkpoints") / time.strftime("%Y%m%d_%H%M%S")
+            self.run_dir.mkdir(parents=True, exist_ok=True)
 
         if dist.get_rank() == 0:
             # Initialize Weights & Biases
@@ -115,19 +128,37 @@ class VJEPATrainer:
                     tokens_frame=self.tokens_per_frame,
                 ),
             )
-            wandb.watch(self.predictor.module, log="gradients", log_freq=50) # Log geradients
+            wandb.watch(self.predictor.module, log="gradients", log_freq=50)
 
         signal.signal(signal.SIGINT, lambda signum, frame: self._save_interrupted_checkpoint())
 
     def _save_checkpoint(self, tag, step, val_loss=None):
         if dist.get_rank() != 0:
             return
-        
-        # Only save predictor weights as requested
+
+        # Save predictor + optimizer + scheduler states when available
         ckpt = {
             "global_step": step,
             "predictor": self.predictor.module.state_dict(),
+            "predictor_config": self.predictor.module.get_config(),
         }
+        try:
+            if hasattr(self, "optimizer") and self.optimizer is not None:
+                ckpt["opt"] = self.optimizer.state_dict()
+        except Exception as e:
+            logger.debug(f"Could not include optimizer state in checkpoint: {e}")
+
+        if hasattr(self, "scheduler") and hasattr(self.scheduler, "state_dict"):
+            try:
+                ckpt["sched"] = self.scheduler.state_dict()
+            except Exception as e:
+                logger.debug(f"Could not include scheduler state in checkpoint: {e}")
+        if hasattr(self, "wd_scheduler") and hasattr(self.wd_scheduler, "state_dict"):
+            try:
+                ckpt["wd_sched"] = self.wd_scheduler.state_dict()
+            except Exception as e:
+                logger.debug(f"Could not include wd_scheduler state in checkpoint: {e}")
+
         if val_loss is not None:
             ckpt["val_loss"] = val_loss
 
@@ -153,6 +184,75 @@ class VJEPATrainer:
         self._save_checkpoint("interrupted", self.global_step)
         logger.info("Interrupted checkpoint saved. Exiting.")
         exit()
+
+    def _load_checkpoint(self, checkpoint_path: str):
+        """Load checkpoint if it contains model/opt/scheduler states. Works with
+        checkpoints produced by this script and (partially) with older checkpoints
+        that only contain model weights."""
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+
+        # Load predictor weights (handle DDP `.module` wrapper)
+        if "predictor_config" in ckpt:
+            # Re-initialize predictor with saved config
+            config = ckpt["predictor_config"]
+            # Ensure norm_layer is correctly referenced if it's a class
+            if "norm_layer" in config and isinstance(config["norm_layer"], str):
+                if config["norm_layer"] == "nn.LayerNorm":
+                    config["norm_layer"] = torch.nn.LayerNorm
+            self.predictor = VJ2GUIPredictor(**config).to(self.device)
+            # Re-wrap with DDP
+            if self.args.device_type == "cuda":
+                self.predictor = DDP(self.predictor, device_ids=[self.args.local_rank])
+            else:
+                self.predictor = DDP(self.predictor)
+            
+            try:
+                self.predictor.module.load_state_dict(ckpt["predictor"])
+            except Exception:
+                try:
+                    self.predictor.load_state_dict(ckpt["predictor"])
+                except Exception as e:
+                    logger.error(f"Failed to load predictor state: {e}")
+        elif "predictor" in ckpt: # Fallback for older checkpoints without config
+            try:
+                self.predictor.module.load_state_dict(ckpt["predictor"])
+            except Exception:
+                try:
+                    self.predictor.load_state_dict(ckpt["predictor"])
+                except Exception as e:
+                    logger.error(f"Failed to load predictor state: {e}")
+
+        if "opt" in ckpt and hasattr(self, "optimizer"):
+            try:
+                self.optimizer.load_state_dict(ckpt["opt"])
+            except Exception as e:
+                logger.error(f"Error loading optimizer state: {e}")
+
+        if "sched" in ckpt and hasattr(self, "scheduler") and hasattr(self.scheduler, "load_state_dict"):
+            try:
+                self.scheduler.load_state_dict(ckpt["sched"])
+            except Exception as e:
+                logger.error(f"Error loading scheduler state: {e}")
+        if "wd_sched" in ckpt and hasattr(self, "wd_scheduler") and hasattr(self.wd_scheduler, "load_state_dict"):
+            try:
+                self.wd_scheduler.load_state_dict(ckpt["wd_sched"])
+            except Exception as e:
+                logger.error(f"Error loading wd_scheduler state: {e}")
+
+        # Restore bookkeeping fields if present
+        if "global_step" in ckpt:
+            self.global_step = ckpt["global_step"]
+        if "val_loss" in ckpt:
+            self.best_val_loss = ckpt["val_loss"]
+        if "epoch" in ckpt:
+            try:
+                self.start_epoch = int(ckpt["epoch"]) + 1
+            except Exception:
+                pass
+
+        self.run_dir = Path(checkpoint_path).parent
+
+        logger.info(f"Loaded checkpoint from {checkpoint_path} (global_step={self.global_step}, start_epoch={self.start_epoch}, best_val_loss={self.best_val_loss})")
 
     def training_loop(self):
         print(f"[DDP] Rank {dist.get_rank()}: Starting training loop for {self.num_epochs} epochs")
@@ -257,7 +357,7 @@ class VJEPATrainer:
         z_all = F.layer_norm(embeddings, (embeddings.size(-1),))
         h_all = z_all
 
-        with autocast():
+        with autocast('cuda'):
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
             jloss = self.loss_fn(z_tf, h_all[:, 1:])
             sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_all[:, self.rollout_horizon].unsqueeze(1))
@@ -270,7 +370,7 @@ class VJEPATrainer:
         h_all = z_all
 
         self.optimizer.zero_grad()
-        with autocast():
+        with autocast('cuda'):
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
             jloss = self.loss_fn(z_tf, h_all[:, 1:])
             sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_all[:, self.rollout_horizon].unsqueeze(1))
@@ -316,9 +416,18 @@ if __name__ == "__main__":
     parser.add_argument("--validation_data_dir", type=str, required=True)
     parser.add_argument("--save_every_epochs", type=int, default=0)
     parser.add_argument("--save_every_iters", type=int, default=500, help="Save checkpoint every N iterations")
-    parser.add_argument("--local_rank", type=int, default=-1)  # Changed default to -1
+    parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--dist-backend", default=None, help="nccl|gloo")
     parser.add_argument("--device", default=None, help="cuda|cpu")
+    parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint file to resume training from")
+    
+    # Model parameters
+    parser.add_argument("--depth", type=int, default=6, help="Depth of predictor model")
+    parser.add_argument("--num_heads", type=int, default=8, help="Number of multi attention heads")
+
+    # Training parameters
+    parser.add_argument("--rollout_horizon", type=int, default=2, help="Number of latent states to recursively predict")
+
     args = parser.parse_args()
 
     # Backend-agnostic initialization
