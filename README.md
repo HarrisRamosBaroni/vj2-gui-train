@@ -2,8 +2,8 @@
 
 ### Get dataset
 - Download or git clone this repo
-- The training dataset consists of Harris' google drive under `final_data/train` and place in an appropriate place such as is `./train`
-- The training requires a separate directory for validation to keeps consistency across sessions (instead of a different random split each session). Download the `final_data/validate` folder from Harris' google drive and place into `./validate`
+- The training dataset consists of Harris' google drive under `dataset/final_data/train` and place in an appropriate place such as is `./train`
+- The training requires a separate directory for validation to keeps consistency across sessions (instead of a different random split each session). Download the `dataset/final_data/validate` folder from Harris' google drive and place into `./validate`
 
 ### Dataset Migration
 - run 
