@@ -126,7 +126,7 @@ class VJEPATrainer:
         if dist.get_rank() == 0:
             # Initialize Weights & Biases
             self.run = wandb.init(
-                project="vjepa2-ac-cross-attention",
+                project="vjepa2-ac",
                 name=f"cross_attn_run_{time.strftime('%Y%m%d_%H%M%S')}",
                 config=dict(
                     epochs=self.num_epochs,
