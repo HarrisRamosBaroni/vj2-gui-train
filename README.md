@@ -23,4 +23,7 @@
 - You may increase batch size depending on the GPU constrants. Adjust `num_workers` as appropriate. Safe to control+c any time.
 
 ### Noop training
-`python -m training.train_multi_gpu_noop --num_epochs 40 --batch_size 64 --num_workers 12 --processed_data_dir ./Train --validation_data_dir ./Validate --depth 24 --num_heads 8 --rollout_horizon 1`
+`python -m training.train_multi_gpu_noop --num_epochs 40 --batch_size 64 --num_workers 12 --processed_data_dir ./Train --validation_data_dir ./Validate --depth 24 --num_heads 8 --rollout_horizon 2`
+
+### Cross attention training
+`python -m training.train_multi_gpu_cross_attention --num_epochs 80 --batch_size 64 --num_workers 12 --processed_data_dir ./Train --validation_data_dir ./Validate --depth 24 --num_heads 8 --rollout_horizon 2`
