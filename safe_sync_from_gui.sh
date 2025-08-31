@@ -10,7 +10,6 @@ FILES_TO_SYNC=(
     "src/"
     "gui_world_model/utils/"
     "gui_world_model/__init__.py"
-    "gui_world_model/encoder.py"
     "gui_world_model/predictor.py"
     "gui_world_model/predictor_cross_attention.py"
     "gui_world_model/predictor_film.py"
@@ -49,9 +48,12 @@ for item in "${FILES_TO_SYNC[@]}"; do
             rsync -avu --existing "$SOURCE_REPO/$item" "$target_path" 2>/dev/null || true
             rsync -avu --ignore-existing "$SOURCE_REPO/$item" "$target_path"
         else
-            # For files, copy only if source is newer or target doesn't exist
-            if [ ! -f "$target_path" ] || [ "$SOURCE_REPO/$item" -nt "$target_path" ]; then
-                echo "  Copying file: $SOURCE_REPO/$item -> $target_path"
+            # For files, copy if target doesn't exist or files are different
+            if [ ! -f "$target_path" ]; then
+                echo "  Copying new file: $SOURCE_REPO/$item -> $target_path"
+                cp "$SOURCE_REPO/$item" "$target_path"
+            elif ! cmp -s "$SOURCE_REPO/$item" "$target_path"; then
+                echo "  Updating file (content differs): $SOURCE_REPO/$item -> $target_path"
                 cp "$SOURCE_REPO/$item" "$target_path"
             else
                 echo "  File $item is up to date"

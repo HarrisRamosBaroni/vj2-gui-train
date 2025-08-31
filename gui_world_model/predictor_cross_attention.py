@@ -143,33 +143,7 @@ class VJ2GUIPredictor(nn.Module):
     ):
         super().__init__()
 
-        # Store hyperparameters for saving/loading
-        self._config = {
-            "img_size": img_size,
-            "patch_size": patch_size,
-            "num_frames": num_frames,
-            "tubelet_size": tubelet_size,
-            "embed_dim": embed_dim,
-            "predictor_embed_dim": predictor_embed_dim,
-            "depth": depth,
-            "num_heads": num_heads,
-            "mlp_ratio": mlp_ratio,
-            "qkv_bias": qkv_bias,
-            "qk_scale": qk_scale,
-            "drop_rate": drop_rate,
-            "attn_drop_rate": attn_drop_rate,
-            "drop_path_rate": drop_path_rate,
-            "norm_layer": norm_layer,
-            "init_std": init_std,
-            "use_silu": use_silu,
-            "wide_silu": wide_silu,
-            "use_activation_checkpointing": use_activation_checkpointing,
-            "use_rope": use_rope,
-            "action_embed_dim": action_embed_dim,
-            "num_action_tokens": num_action_tokens,
-            "cross_attn_depth": cross_attn_depth,
-            "cross_attn_drop_path_rate": cross_attn_drop_path_rate,
-        }
+        self._config = self._capture_init_args(locals())
 
         self.grid_height = img_size[0] // patch_size
         self.grid_width = img_size[1] // patch_size
@@ -354,6 +328,11 @@ class VJ2GUIPredictor(nn.Module):
     def get_config(self):
         """Returns the model's initialization configuration."""
         return self._config
+
+    def _capture_init_args(self, local_vars):
+        # Captures constructor arguments for saving/loading.
+        # Exclude 'self' and '__class__'
+        return {k: v for k, v in local_vars.items() if k not in ['self', '__class__']}
 
 
 def load_predictor_model(model_path, device):
