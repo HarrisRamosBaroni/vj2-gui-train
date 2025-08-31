@@ -7,7 +7,7 @@ This explains the easiest way for you to copy the shared Google Drive folder nam
 ## Prerequisites
 - The folder `final_data` has been shared with your Google account with Viewer access.
 - The folder owner has not disabled downloading for viewers. If download is disabled, rclone cannot copy files.
-- You will be copying ordinary binary files (.npz). These will download unchanged.
+- You will be copying ordinary files (.h5). These will download unchanged.
 
 ---
 
@@ -15,7 +15,7 @@ This explains the easiest way for you to copy the shared Google Drive folder nam
 1. In Drive web: Shared with me → right‑click `final_data` → **Add shortcut to Drive** → choose **My Drive**.  
 2. Install rclone.  
 3. Configure a Drive remote and authorize with your Google account.  
-4. Run: `rclone copy -P mygdrive:"final_data" /path/to/local/final_data`
+4. Run: `rclone copy -P mygdrive:final_data/mother /path/to/local/mother`
 
 Detailed steps below.
 
@@ -46,9 +46,9 @@ Follow the interactive prompts:
 - For `client_id` / `client_secret` you can leave blank (press Enter), unless you want to provide your own
 - For `scope` choose `drive.readonly` (recommended)
 - For `root_folder_id` leave blank (since you added the shortcut to My Drive)
+- To avoid API rate limits: For large datasets, you may want to create your own client ID and secret to avoid being hit by API rate limits. This is a very straightforward process. For detailed steps on how to do this, watch the video titled "how to make your own client id for rclone | rclone part 2" from the IT AssistanT channel. https://www.youtube.com/watch?v=aCw2XuekZQQ
 - Finish the OAuth flow when rclone opens the browser to authorize your Google account
-
-If you prefer a non-interactive creation, see `rclone config create` in rclone docs.
+- On headless machines: When configuring the remote, be aware of the "Use auto config?" prompt. If you are on a remote or headless machine, you must answer N to this question to avoid the automatic browser-based configuration.
 
 ---
 
@@ -64,10 +64,9 @@ rclone ls mygdrive:"final_data"
 
 To copy the entire folder locally with progress:
 ```
-rclone copy -P mygdrive:"final_data" /local/path/final_data
+rclone copy -P mygdrive:final_data/mother /local/path/mother
 ```
 Notes:
-- Use quotes if the folder name has spaces.
 - `-P` shows progress and transfer stats.
 - For faster transfers on large datasets, you can tune:
   - `--transfers 8`
@@ -75,28 +74,10 @@ Notes:
   - `--drive-chunk-size 64M`
   Example:
   ```
-  rclone copy -P --transfers 8 --drive-chunk-size 64M mygdrive:"final_data" /local/path/final_data
-  ```
-
----
-
-## Alternative: access by folder ID (no shortcut)
-If you or the sharer prefer not to add a shortcut, you can target the shared folder by its folder ID.
-
-1. Get the folder ID from the share URL the owner gave you. The URL looks like:
-   `https://drive.google.com/drive/folders/FOLDERID`
-   Copy `FOLDERID`.
-
-2. You can either:
-- Set `root_folder_id` in the rclone remote config to `FOLDERID` (then `mygdrive:` refers to that folder), or
-- Pass it on the command line:
-  ```
-  rclone copy mygdrive: /local/path/final_data --drive-root-folder-id FOLDERID -P
+  rclone copy -P --transfers 8 --drive-chunk-size 128M mygdrive:final_data/mother /local/path/mother
   ```
 
 ---
 
 ## Troubleshooting
-- Permission errors: confirm the folder is shared with the exact Google account you used to authorize rclone and that viewers can download.
-- Google Docs/Sheets/Slides: not relevant here (you’re using .npz). rclone would export Google Docs to another format; binary files download unchanged.
 - If OAuth fails in the rclone config flow, try running `rclone config` again and ensure you complete the browser authorization.

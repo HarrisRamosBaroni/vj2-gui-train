@@ -2,9 +2,9 @@
 
 ### Get dataset
 - Download or git clone this repo
-- The entire dataset consists of Harris' google drive under `dataset/mother/` and place in an appropriate place such as is `./mother`
+- The entire dataset consists of Harris' google drive under `dataset/final_data/mother` and place in an appropriate place such as is `./mother`
 
-`rclone copy -P --transfers 8 --checkers 8 --drive-chunk-size 128M --fast-list <remote name>:vj2gui/dataset/mother ./mother`
+`rclone copy -P --transfers 8 --checkers 8 --drive-chunk-size 128M --fast-list <remote name>:vj2gui/dataset/final_data/mother ./mother`
 
 ### Dataset split
 Run:
