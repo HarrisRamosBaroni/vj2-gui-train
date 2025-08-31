@@ -19,7 +19,7 @@ FILES_TO_SYNC=(
     "training/migrate_npz_to_npy.py"
     "training/train_v2.py"
     "training/utils.py"
-    "preprocessing/generate_split_manifest.py"
+    "preprocess/generate_split_manifest.py"
     # ".gitignore"
     # "RCLONE_README.md"
     # "TRAIN_README.md"
