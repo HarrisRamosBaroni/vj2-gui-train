@@ -10,6 +10,7 @@ FILES_TO_SYNC=(
     "src/"
     "gui_world_model/utils/"
     "gui_world_model/__init__.py"
+    "gui_world_model/encoder.py"
     "gui_world_model/predictor.py"
     "gui_world_model/predictor_cross_attention.py"
     "gui_world_model/predictor_film.py"
