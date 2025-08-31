@@ -36,7 +36,7 @@ EXECUTOR_POLLING_HZ = 1000.0
 
 # The number of "Action Batches" the planner optimizes over. This is the `horizon`
 # in the MPC problem. An "Action Batch" is the unit of optimization.
-PLANNING_HORIZON_BATCHES = 20
+PLANNING_HORIZON_BATCHES = 1
 
 # The number of atomic actions contained within a single "Action Batch".
 # The total number of actions generated per plan is:
@@ -52,12 +52,18 @@ ACTIONS_PER_BATCH = int(ACTION_HZ / PLANNER_HZ)
 # Format: [x_norm, y_norm, touch_state_norm]
 ACTION_DIM = 3
 
+# Action autoencoder latent action dimension
+LATENT_ACTION_DIM = 20
+
 #
 # The number of observations (frames) in a single training window (4s).
 # MAX_OBSERVATION_CONTEXT = 16
 # WINDOW_TIME = int(MAX_OBSERVATION_CONTEXT / OBSERVER_HZ)  # 16/4hz=4s
 # OBSERVATIONS_PER_WINDOW = WINDOW_TIME * OBSERVER_HZ # 4*4 = 16 so full context, duh
 OBSERVATIONS_PER_WINDOW = int(4.0 * OBSERVER_HZ)
+
+# Number of latent states per window (half OBSERVATIONS_PER_WINDOW since tubelets are size 2)
+LATENT_STATES_PER_WINDOW = OBSERVATIONS_PER_WINDOW // 2   # 8
 
 # The number of action blocks corresponding to a training window.
 # One action block is the transition between two latent states, and since there
@@ -75,10 +81,13 @@ ROLLOUT_HORIZON = 2
 NATIVE_INJECTOR_PATH = "/data/local/tmp/event_injector"
 
 # The minimum number of frames the VJEPA encoder requires to create a context. Max is 16.
-ENCODER_CLIP_LEN = 4
+ENCODER_CLIP_LEN = 2
+
+# The minimum number of frames the VJEPA encoder requires to create a context. Max is 16.
+NUM_CONTEXT_FRAMES = 16
 
 # The number of gradient descent steps the planner takes to find a good plan.
-PLANNING_ITERATIONS = 5
+PLANNING_ITERATIONS = 10
 
 # Toggle for adjusting planner timestamps to account for planning time.
 # Set to True to make action dispatch more consistent with ACTION_HZ
