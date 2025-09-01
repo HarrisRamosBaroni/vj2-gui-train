@@ -40,7 +40,7 @@ You may increase batch size depending on the GPU constrants. Adjust `num_workers
 `python -m training.train_v2 --model_type cross_attention --num_epochs 40 --batch_size 64 --num_workers 12 --processed_data_dir ./mother --manifest ./mother/manifests/experiment_A.json --depth 24 --num_heads 8 --rollout_horizon 2`
 
 ### FiLM training
-`python -m training.train_v2 --model_type film --num_epochs 40 --batch_size 64 --num_workers 12 --processed_data_dir ./mother --manifest ./mother/manifests/experiment_A.json --depth 24 --num_heads 8 --rollout_horizon 2`
+`python -m training.train_v2 --model_type film --num_epochs 40 --batch_size 64 --num_workers 12 --processed_data_dir ./mother --manifest ./mother/manifests/experiment_A.json --depth 18 --num_heads 8 --rollout_horizon 2 --film_layers_modulated 6`
 
 
 
