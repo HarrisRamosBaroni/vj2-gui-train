@@ -22,6 +22,7 @@ from gui_world_model.predictor_film import VJ2GUIPredictorFiLM
 from gui_world_model.predictor_a_encoded import VJ2GUIPredictorActionEncoded
 from training.validators.input_sensitivity import InputSensitivityValidator
 from training.validators.film_gamma import FilmGammaValidator
+from training.validators.loss_distribution import LossDistributionValidator
 from gui_world_model.utils.loading import load_model
 
 # from testing.model_info import analyze_my_model
@@ -36,6 +37,7 @@ MODEL_REGISTRY = {
 VALIDATOR_REGISTRY = {
     "input_sensitivity": InputSensitivityValidator,
     "film_gamma": FilmGammaValidator,
+    "loss_distribution": LossDistributionValidator,
 }
 
 logger = get_logger()

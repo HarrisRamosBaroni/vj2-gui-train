@@ -14,6 +14,7 @@ FILES_TO_SYNC=(
     "gui_world_model/predictor_cross_attention.py"
     "gui_world_model/predictor_film.py"
     # "training/test/"
+    "training/validators/"
     "training/__init__.py"
     "training/dataloader.py"
     "training/migrate_npz_to_npy.py"
