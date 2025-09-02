@@ -48,33 +48,53 @@ def init_opt(
     eps=1e-8,
     zero_init_bias_wd=True,
     enc_lr_scale=1.0,
+    custom_parameters=None,  # NEW: For action-encoded training
 ):
     param_groups = []
 
-    if encoder is not None:
-        param_groups.extend([
-            {
-                "params": (p for n, p in encoder.named_parameters() if ("bias" not in n) and (len(p.shape) != 1) and p.requires_grad),
-                "lr_scale": enc_lr_scale,
-            },
-            {
-                "params": (p for n, p in encoder.named_parameters() if ("bias" in n) or (len(p.shape) == 1) and p.requires_grad),
+    # NEW: Handle custom parameters (for action-encoded training with frozen CNN)
+    if custom_parameters is not None:
+        # Split custom parameters by bias vs non-bias
+        non_bias_params = [p for p in custom_parameters if len(p.shape) > 1]
+        bias_params = [p for p in custom_parameters if len(p.shape) == 1]
+        
+        if non_bias_params:
+            param_groups.append({
+                "params": non_bias_params,
+            })
+        if bias_params:
+            param_groups.append({
+                "params": bias_params,
                 "WD_exclude": zero_init_bias_wd,
                 "weight_decay": 0,
-                "lr_scale": enc_lr_scale,
-            },
-        ])
-    
-    param_groups.extend([
-        {
-            "params": (p for n, p in predictor.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
-        },
-        {
-            "params": (p for n, p in predictor.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
-            "WD_exclude": zero_init_bias_wd,
-            "weight_decay": 0,
-        },
-    ])
+            })
+    else:
+        # Original logic for encoder + predictor
+        if encoder is not None:
+            param_groups.extend([
+                {
+                    "params": (p for n, p in encoder.named_parameters() if ("bias" not in n) and (len(p.shape) != 1) and p.requires_grad),
+                    "lr_scale": enc_lr_scale,
+                },
+                {
+                    "params": (p for n, p in encoder.named_parameters() if ("bias" in n) or (len(p.shape) == 1) and p.requires_grad),
+                    "WD_exclude": zero_init_bias_wd,
+                    "weight_decay": 0,
+                    "lr_scale": enc_lr_scale,
+                },
+            ])
+        
+        if predictor is not None:
+            param_groups.extend([
+                {
+                    "params": (p for n, p in predictor.named_parameters() if ("bias" not in n) and (len(p.shape) != 1)),
+                },
+                {
+                    "params": (p for n, p in predictor.named_parameters() if ("bias" in n) or (len(p.shape) == 1)),
+                    "WD_exclude": zero_init_bias_wd,
+                    "weight_decay": 0,
+                },
+            ])
 
     optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
     scheduler = WSDSchedule(

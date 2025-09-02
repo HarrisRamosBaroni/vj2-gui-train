@@ -19,12 +19,23 @@ from training.utils import init_opt
 from gui_world_model.predictor import VJ2GUIPredictor
 from gui_world_model.predictor_cross_attention import VJ2GUIPredictor as VJ2GUIPredictorCrossAttention
 from gui_world_model.predictor_film import VJ2GUIPredictorFiLM
+from gui_world_model.predictor_a_encoded import VJ2GUIPredictorActionEncoded
+from training.validators.input_sensitivity import InputSensitivityValidator
+from training.validators.film_gamma import FilmGammaValidator
+from gui_world_model.utils.loading import load_model
+
 # from testing.model_info import analyze_my_model
 
 MODEL_REGISTRY = {
     "vanilla": VJ2GUIPredictor,
     "cross_attention": VJ2GUIPredictorCrossAttention,
     "film": VJ2GUIPredictorFiLM,
+    "encode_a": VJ2GUIPredictorActionEncoded,
+}
+
+VALIDATOR_REGISTRY = {
+    "input_sensitivity": InputSensitivityValidator,
+    "film_gamma": FilmGammaValidator,
 }
 
 logger = get_logger()
@@ -65,7 +76,7 @@ class VJEPATrainer:
         
         print(f"[DDP] Rank {dist.get_rank()}: Model initialized on {self.device}")
 
-        self.scaler = GradScaler('cuda')
+        self.scaler = GradScaler('cuda', init_scale=2.**16, enabled=True)
 
         # Dataloader initialization
         if args.manifest:
@@ -140,6 +151,16 @@ class VJEPATrainer:
             self.run_dir = Path("resource/checkpoints") / run_dir_name
             self.run_dir.mkdir(parents=True, exist_ok=True)
 
+        self.validators = []
+        if dist.get_rank() == 0 and args.validators:
+            for validator_name in args.validators:
+                validator_args = {
+                    "frequency": args.validator_frequency
+                }
+                self.validators.append(VALIDATOR_REGISTRY[validator_name](**validator_args))
+
+        self.validation_cycle_count = 0
+
         if dist.get_rank() == 0:
             # Initialize Weights & Biases
             self.run = wandb.init(
@@ -156,11 +177,16 @@ class VJEPATrainer:
             return
 
         # Save predictor + optimizer + scheduler states when available
+        config = self.predictor.module.get_config()
+        config["model_type"] = self.model_type
+
         ckpt = {
             "global_step": step,
             "predictor": self.predictor.module.state_dict(),
-            "predictor_config": self.predictor.module.get_config(),
+            "predictor_config": config,
         }
+        if hasattr(self, "scaler") and self.scaler is not None:
+            ckpt["scaler"] = self.scaler.state_dict()
         try:
             if hasattr(self, "optimizer") and self.optimizer is not None:
                 ckpt["opt"] = self.optimizer.state_dict()
@@ -205,46 +231,44 @@ class VJEPATrainer:
         exit()
 
     def _load_checkpoint(self, checkpoint_path: str):
-        """Load checkpoint if it contains model/opt/scheduler states. Works with
-        checkpoints produced by this script and (partially) with older checkpoints
-        that only contain model weights."""
+        """
+        Load a checkpoint to resume training.
+
+        This function uses the canonical `load_model` utility to restore the
+        model's architecture and weights, and then loads the optimizer,
+        schedulers, and other training-specific states.
+        """
+        # --- 1. Load Model using Canonical Loader ---
+        # The canonical loader handles instantiation and weight loading.
+        # We set the model to train() mode after loading, as the loader sets it to eval().
+        model = load_model(
+            model_path=checkpoint_path,
+            device=self.device,
+            model_registry=MODEL_REGISTRY,
+            model_type=self.model_type,
+            prepare_for_inference=False
+        ).train()
+
+        # Wrap with DDP
+        if self.args.device_type == "cuda":
+            self.predictor = DDP(model, device_ids=[self.args.local_rank])
+        else:
+            self.predictor = DDP(model)
+
+        # --- 2. Load Training-Specific States (Optimizer, Schedulers, etc.) ---
         ckpt = torch.load(checkpoint_path, map_location=self.device)
 
-        # Load predictor weights (handle DDP `.module` wrapper)
-        if "predictor_config" in ckpt:
-            # Re-initialize predictor with saved config
-            config = ckpt["predictor_config"]
-            model_class = MODEL_REGISTRY[self.model_type]
-            # Ensure norm_layer is correctly referenced if it's a class
-            if "norm_layer" in config and isinstance(config["norm_layer"], str):
-                if config["norm_layer"] == "nn.LayerNorm":
-                    config["norm_layer"] = torch.nn.LayerNorm
-            
-            # Filter config to only pass relevant args to the model
-            model_args = {k: v for k, v in config.items() if k in model_class.__init__.__code__.co_varnames}
-            self.predictor = model_class(**model_args).to(self.device)
-
-            # Re-wrap with DDP
-            if self.args.device_type == "cuda":
-                self.predictor = DDP(self.predictor, device_ids=[self.args.local_rank])
-            else:
-                self.predictor = DDP(self.predictor)
-            
-            try:
-                self.predictor.module.load_state_dict(ckpt["predictor"])
-            except Exception:
-                try:
-                    self.predictor.load_state_dict(ckpt["predictor"])
-                except Exception as e:
-                    logger.error(f"Failed to load predictor state: {e}")
-        elif "predictor" in ckpt: # Fallback for older checkpoints without config
-            try:
-                self.predictor.module.load_state_dict(ckpt["predictor"])
-            except Exception:
-                try:
-                    self.predictor.load_state_dict(ckpt["predictor"])
-                except Exception as e:
-                    logger.error(f"Failed to load predictor state: {e}")
+        # Re-initialize optimizers with the new model's parameters
+        self.optimizer, self.scheduler, self.wd_scheduler = init_opt(
+            encoder=None,
+            predictor=self.predictor.module,
+            iterations_per_epoch=self.ipe,
+            start_lr=0.000075,
+            ref_lr=0.000425,
+            warmup=15,
+            anneal=15,
+            num_epochs=self.num_epochs
+        )
 
         if "opt" in ckpt and hasattr(self, "optimizer"):
             try:
@@ -273,6 +297,12 @@ class VJEPATrainer:
                 self.start_epoch = int(ckpt["epoch"]) + 1
             except Exception:
                 pass
+        if "scaler" in ckpt and hasattr(self, "scaler"):
+            try:
+                self.scaler.load_state_dict(ckpt["scaler"])
+                self.scaler.set_enabled(True)
+            except Exception as e:
+                logger.error(f"Error loading scaler state: {e}")
 
         self.run_dir = Path(checkpoint_path).parent
 
@@ -316,7 +346,7 @@ class VJEPATrainer:
                     })
 
                 # Routine checkpoint saving every N iterations
-                if self.global_step % self.save_every_iters == 0:
+                if self.save_every_iters > 0 and self.global_step % self.save_every_iters == 0:
                     if dist.get_rank() == 0:
                         self._save_checkpoint(f"step_{self.global_step}", self.global_step)
 
@@ -339,6 +369,22 @@ class VJEPATrainer:
                                 self._save_checkpoint("best", self.global_step, val_loss)
                                 logger.info(f"🏆 New best validation loss: {val_loss:.6f}")
                     
+                    # --- Run Validators ---
+                    self.validation_cycle_count += 1
+                    if dist.get_rank() == 0 and self.validators:
+                        logger.info("Running custom validators...")
+                        for validator in self.validators:
+                            if validator.should_run(self.validation_cycle_count):
+                                try:
+                                    validator.run(
+                                        model=self.predictor.module, # unwrap DDP
+                                        validation_loader=self.validation_loader,
+                                        device=self.device,
+                                        global_step=self.global_step
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Validator {type(validator).__name__} failed: {e}")
+
                     dist.barrier()
                     print(f"[DDP] Rank {dist.get_rank()}: Exiting validation at epoch {epoch}, iter {itr}")
                     if dist.get_rank() == 0:
@@ -381,7 +427,7 @@ class VJEPATrainer:
         z_all = F.layer_norm(embeddings, (embeddings.size(-1),))
         h_all = z_all
 
-        with autocast('cuda'):
+        with autocast(device_type='cuda'):
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
             jloss = self.loss_fn(z_tf, h_all[:, 1:])
             sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_all[:, self.rollout_horizon].unsqueeze(1))
@@ -394,15 +440,20 @@ class VJEPATrainer:
         h_all = z_all
 
         self.optimizer.zero_grad()
-        with autocast('cuda'):
+        
+        with autocast(device_type='cuda'):
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
             jloss = self.loss_fn(z_tf, h_all[:, 1:])
             sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_all[:, self.rollout_horizon].unsqueeze(1))
             loss = jloss + sloss
-
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        
+        # logger.info(f"Loss value before checking isfinite: {loss.item()}")
+        if torch.isfinite(loss):
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            logger.info(f"Skipping step due to non-finite loss: {loss.item()}")
 
         return float(loss), float(jloss), float(sloss), lr, wd
 
@@ -449,6 +500,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_every_iters", type=int, default=500)
     parser.add_argument("--save_every_epochs", type=int, default=0) # Disabled by default
     parser.add_argument("--load_checkpoint", type=str, default=None)
+    
+    # Validator arguments
+    parser.add_argument("--validators", nargs='*', default=[], choices=VALIDATOR_REGISTRY.keys(),
+                        help="List of validators to run during validation.")
+    parser.add_argument("--validator_frequency", type=int, default=1,
+                        help="Run validators every N validation cycles.")
 
     # DDP arguments
     parser.add_argument("--local_rank", type=int, default=-1)
@@ -472,7 +529,14 @@ if __name__ == "__main__":
     parser.add_argument("--film_d_c", type=int, default=128)
     parser.add_argument("--film_layers_modulated", type=int, default=6)
 
+    # Action-Encoded specific
+    parser.add_argument("--frozen_action_encoder_checkpoint", type=str, default=None, help="Path to frozen CNN action encoder checkpoint for encode_a model")
+
     args = parser.parse_args()
+
+    # Validate arguments
+    if args.model_type == "encode_a" and not args.frozen_action_encoder_checkpoint:
+        parser.error("--frozen_action_encoder_checkpoint is required when model_type is 'encode_a'")
 
     # --- DDP Initialization ---
     use_cuda = torch.cuda.is_available()

@@ -182,40 +182,6 @@ class VJ2GUIPredictor(nn.Module):
         return {k: v for k, v in local_vars.items() if k not in ['self', '__class__']}
 
 
-def load_predictor_model(model_path, device):
-    """Loads the VJ2GUIPredictor model from a checkpoint."""
-    print(f"Loading predictor from: {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
-
-    model_config = None
-    if "predictor_config" in checkpoint:
-        model_config = checkpoint["predictor_config"]
-        # Ensure norm_layer is correctly referenced if it's a string
-        if "norm_layer" in model_config and isinstance(model_config["norm_layer"], str):
-            if model_config["norm_layer"] == "nn.LayerNorm":
-                model_config["norm_layer"] = torch.nn.LayerNorm
-        model = VJ2GUIPredictor(**model_config).to(device)
-    else:
-        # Fallback for older checkpoints without config, assume default depth
-        print("⚠️ Checkpoint does not contain model configuration. Using default depth=24, num_frames=OBSERVATIONS_PER_WINDOW, tubelet_size=2")
-        model = VJ2GUIPredictor(depth=24, num_frames=OBSERVATIONS_PER_WINDOW, tubelet_size=2).to(device)
-
-    # Handle various checkpoint formats (DDP, simple, etc.)
-    if "predictor" in checkpoint:
-        state_dict = checkpoint["predictor"]
-    elif "model" in checkpoint:
-        state_dict = checkpoint["model"]
-    else:
-        state_dict = checkpoint
-
-    # Remove `module.` prefix if present from DDP training
-    new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-
-    model.load_state_dict(new_state_dict)
-    model.eval()
-    model.requires_grad_(False)
-    print("✅ Predictor loaded successfully.")
-    return model
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
