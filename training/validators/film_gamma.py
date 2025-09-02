@@ -17,7 +17,7 @@ class FilmGammaValidator(BaseValidator):
         all_gammas = []
         
         # film_heads is a ModuleList of nn.Linear layers
-        for head in model.film_heads.film_generators:
+        for head in model.film_heads.generators:
             # Each head is a linear layer that outputs concatenated gammas and betas
             # The first half of the output dimension is gammas
             output_dim = head.out_features

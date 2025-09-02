@@ -1,10 +1,13 @@
 import torch
 import torch.nn.functional as F
+from logging import getLogger
 import wandb
 import matplotlib.pyplot as plt
 from scipy import stats
 import numpy as np
 import random
+
+logger = getLogger(__name__)
 
 from .base import BaseValidator
 
@@ -52,7 +55,9 @@ class InputSensitivityValidator(BaseValidator):
             # Predictor expects [B, T, N, D], so we add T=1 dimension
             z_batch = torch.stack(states_to_batch).unsqueeze(1)
             
+            logger.info(f"InputSensitivityValidator: z_batch shape: {z_batch.shape}, a_batch shape: {a_batch.shape}")
             preds = model(z_batch, a_batch)
+            logger.info(f"InputSensitivityValidator: preds shape: {preds.shape}")
             
             for k in range(0, len(states_to_batch), 2):
                 z1 = states_to_batch[k]

@@ -144,10 +144,8 @@ class VJEPATrainer:
                 self._load_checkpoint(args.load_checkpoint)
             except Exception as e:
                 logger.error(f"❌ Error loading checkpoint {args.load_checkpoint}: {e}")
-                # fall back to a new run dir
-                run_dir_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{self.model_type}"
-                self.run_dir = Path("resource/checkpoints") / run_dir_name
-                self.run_dir.mkdir(parents=True, exist_ok=True)
+                logger.error("Terminating training due to checkpoint loading failure.")
+                exit(1)
         else:
             run_dir_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{self.model_type}"
             self.run_dir = Path("resource/checkpoints") / run_dir_name
@@ -302,7 +300,6 @@ class VJEPATrainer:
         if "scaler" in ckpt and hasattr(self, "scaler"):
             try:
                 self.scaler.load_state_dict(ckpt["scaler"])
-                self.scaler.set_enabled(True)
             except Exception as e:
                 logger.error(f"Error loading scaler state: {e}")
 
