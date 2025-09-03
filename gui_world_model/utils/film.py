@@ -70,29 +70,17 @@ class FiLMHeads(nn.Module):
                 'beta_ff': nn.Linear(context_dim, model_dim),
             })
             self.heads.append(layer_heads)
-        
-        self._init_weights()
-
-    def _init_weights(self):
-        """
-        Initializes weights to produce gamma ~ 1 and beta ~ 0 at the beginning of training.
-        """
-        for layer_heads in self.heads:
-            for head_name, head in layer_heads.items():
-                nn.init.zeros_(head.weight)
-                if 'gamma' in head_name:
-                    nn.init.constant_(head.bias, 1.0)
-                else: # beta
-                    nn.init.zeros_(head.bias)
 
     def forward(self, context, clamp_gamma_alpha=None):
         """
         Generates FiLM parameters for all modulated layers.
-        
+        The gamma heads output a residual `∆γ`, and the final `γ = 1 + ∆γ`.
+
         Args:
             context (torch.Tensor): The action context vector of shape [B, T, D_ctx].
-            clamp_gamma_alpha (float, optional): If provided, clamps gamma values
-                using the formula: 1 + alpha * tanh(gamma). Defaults to None.
+            clamp_gamma_alpha (float, optional): If provided, clamps the *residual*
+                `∆γ` using `α * tanh(∆γ)`. The final gamma is `1 + α * tanh(∆γ)`.
+                This is a legacy option and generally not recommended.
 
         Returns:
             dict: A nested dictionary where keys are layer indices and values are
@@ -103,8 +91,14 @@ class FiLMHeads(nn.Module):
             layer_params = {}
             for head_name, head in layer_heads.items():
                 param = head(context)
-                if 'gamma' in head_name and clamp_gamma_alpha is not None and clamp_gamma_alpha > 0:
-                    param = 1 + clamp_gamma_alpha * torch.tanh(param)
+                if 'gamma' in head_name:
+                    # Implement γ = 1 + ∆γ for stability. `param` is ∆γ.
+                    # The head's default-initialized weights/biases produce ∆γ ≈ 0 at start.
+                    if clamp_gamma_alpha is not None and clamp_gamma_alpha > 0:
+                        param = 1.0 + clamp_gamma_alpha * torch.tanh(param)
+                    else:
+                        param = 1.0 + param
+                
                 layer_params[head_name] = param.unsqueeze(2) # [B, T, 1, D_m] for broadcasting
             film_params[i] = layer_params
         return film_params

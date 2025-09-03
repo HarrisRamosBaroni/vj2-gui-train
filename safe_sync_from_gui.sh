@@ -13,6 +13,7 @@ FILES_TO_SYNC=(
     "gui_world_model/predictor.py"
     "gui_world_model/predictor_cross_attention.py"
     "gui_world_model/predictor_film.py"
+    "gui_world_model/predictor_prob_film.py"
     # "training/test/"
     "training/validators/"
     "training/__init__.py"

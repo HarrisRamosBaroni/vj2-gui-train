@@ -30,78 +30,80 @@ class LossDistributionValidator(BaseValidator):
     def run(self, model: torch.nn.Module, validation_loader: torch.utils.data.DataLoader, device: torch.device, global_step: int):
         model.eval()
 
-        jloss_vals = []
-        sloss_vals = []
+        try:
+            jloss_vals = []
+            sloss_vals = []
 
-        batches_processed = 0
-        for sample in validation_loader:
-            embeddings, actions = sample
-            embeddings = embeddings.to(device)
-            actions = actions.to(device, dtype=torch.float)
+            batches_processed = 0
+            for sample in validation_loader:
+                embeddings, actions = sample
+                embeddings = embeddings.to(device)
+                actions = actions.to(device, dtype=torch.float)
 
-            # Layer-normalize embeddings (same as trainer)
-            z_all = F.layer_norm(embeddings, (embeddings.size(-1),))
-            h_all = z_all  # target
+                # Layer-normalize embeddings (same as trainer)
+                z_all = F.layer_norm(embeddings, (embeddings.size(-1),))
+                h_all = z_all  # target
 
-            # Format actions consistent with trainer
-            if hasattr(model, 'actions_formatter'):
-                formatted_actions = model.actions_formatter(actions)
-            else:
-                B, T_seq, _, _ = actions.shape
-                formatted_actions = actions.view(B, T_seq, -1)
+                # Format actions consistent with trainer
+                if hasattr(model, 'actions_formatter'):
+                    formatted_actions = model.actions_formatter(actions)
+                else:
+                    B, T_seq, _, _ = actions.shape
+                    formatted_actions = actions.view(B, T_seq, -1)
 
-            B = z_all.size(0)
+                B = z_all.size(0)
 
-            # --- Teacher forcing predictions (z_tf) ---
-            # z_tf should predict h_all[:, 1:] from z_all[:, :-1] and formatted_actions
-            try:
-                z_tf = model(z_all[:, :-1], formatted_actions)
-            except Exception:
-                # If model fails on this batch (shape mismatch), skip it.
+                # --- Teacher forcing predictions (z_tf) ---
+                # z_tf should predict h_all[:, 1:] from z_all[:, :-1] and formatted_actions
+                try:
+                    z_tf = model(z_all[:, :-1], formatted_actions)
+                except Exception:
+                    # If model fails on this batch (shape mismatch), skip it.
+                    batches_processed += 1
+                    if batches_processed >= self.max_batches:
+                        break
+                    continue
+
+                if z_tf.shape[0] != B:
+                    # Unexpected shape, skip
+                    batches_processed += 1
+                    if batches_processed >= self.max_batches:
+                        break
+                    continue
+
+                # Per-transition teacher-forcing loss: mean over tokens, channels
+                # z_tf and h_all[:,1:] shapes: [B, T-1, N, D]
+                jloss_per_transition = torch.mean(torch.abs(z_tf - h_all[:, 1:]) ** self.loss_exp, dim=(-2,-1)) / float(self.loss_exp)
+                # Reshape from [B, T-1] to a flat list of losses
+                jloss_vals.extend(jloss_per_transition.flatten().cpu().numpy().tolist())
+
+                # --- Rollout predictions (autoregressive) ---
+                # Start from z_all[:, 0] and iteratively predict for rollout_horizon steps
+                z_rollout = z_all[:, 0].unsqueeze(1)  # [B, 1, N, D]
+                for i in range(self.rollout_horizon):
+                    # Consistent with trainer: slice the action for the current timestep
+                    # This works for both 3D [B,T,A] and 4D [B,T,L,3] action tensors
+                    a = formatted_actions[:, i].unsqueeze(1)
+                    z_rollout = model(z_rollout, a)
+
+                # z_rollout is [B, 1, N, D] -> squeeze time dim
+                z_rollout_final = z_rollout.squeeze(1)
+                # target at rollout horizon
+                if self.rollout_horizon < h_all.size(1):
+                    target = h_all[:, self.rollout_horizon]
+                    # Per-sample rollout loss: mean over tokens and channels
+                    sloss_per_sample = torch.mean(torch.abs(z_rollout_final - target) ** self.loss_exp, dim=(1,2)) / float(self.loss_exp)
+                    sloss_vals.extend(sloss_per_sample.cpu().numpy().tolist())
+
                 batches_processed += 1
                 if batches_processed >= self.max_batches:
                     break
-                continue
 
-            if z_tf.shape[0] != B:
-                # Unexpected shape, skip
-                batches_processed += 1
-                if batches_processed >= self.max_batches:
-                    break
-                continue
-
-            # Per-sample teacher-forcing loss: mean over time, tokens, channels
-            # z_tf and h_all[:,1:] shapes: [B, T-1, N, D]
-            jloss_per_sample = torch.mean(torch.abs(z_tf - h_all[:, 1:]) ** self.loss_exp, dim=(1,2,3)) / float(self.loss_exp)
-            jloss_vals.extend(jloss_per_sample.cpu().numpy().tolist())
-
-            # --- Rollout predictions (autoregressive) ---
-            # Start from z_all[:, 0] and iteratively predict for rollout_horizon steps
-            z_rollout = z_all[:, 0].unsqueeze(1)  # [B, 1, N, D]
-            for i in range(self.rollout_horizon):
-                # Consistent with trainer: slice the action for the current timestep
-                # This works for both 3D [B,T,A] and 4D [B,T,L,3] action tensors
-                a = formatted_actions[:, i].unsqueeze(1)
-                z_rollout = model(z_rollout, a)
-
-            # z_rollout is [B, 1, N, D] -> squeeze time dim
-            z_rollout_final = z_rollout.squeeze(1)
-            # target at rollout horizon
-            if self.rollout_horizon < h_all.size(1):
-                target = h_all[:, self.rollout_horizon]
-                # Per-sample rollout loss: mean over tokens and channels
-                sloss_per_sample = torch.mean(torch.abs(z_rollout_final - target) ** self.loss_exp, dim=(1,2)) / float(self.loss_exp)
-                sloss_vals.extend(sloss_per_sample.cpu().numpy().tolist())
-
-            batches_processed += 1
-            if batches_processed >= self.max_batches:
-                break
-
-        model.train()
-
-        # If no values collected, skip logging
-        if len(jloss_vals) == 0 and len(sloss_vals) == 0:
-            return
+            # If no values collected, skip logging
+            if len(jloss_vals) == 0 and len(sloss_vals) == 0:
+                return {}
+        finally:
+            model.train()
 
         # Plot histograms
         figs = {}
@@ -138,8 +140,8 @@ class LossDistributionValidator(BaseValidator):
             log_dict["validation/sloss_std"] = float(np.std(sloss_vals))
             log_dict["validation/sloss_hist_image"] = wandb.Image(figs["validation/sloss_hist"])
 
-        wandb.log(log_dict, step=global_step)
-
         # Close figures
         for f in figs.values():
             plt.close(f)
+            
+        return log_dict

@@ -11,6 +11,8 @@ import time
 import argparse
 import signal
 import datetime
+import inspect
+import shutil
 
 from training.dataloader import init_preprocessed_data_loader
 from config import ROLLOUT_HORIZON, OBSERVATIONS_PER_WINDOW
@@ -19,10 +21,14 @@ from training.utils import init_opt
 from gui_world_model.predictor import VJ2GUIPredictor
 from gui_world_model.predictor_cross_attention import VJ2GUIPredictor as VJ2GUIPredictorCrossAttention
 from gui_world_model.predictor_film import VJ2GUIPredictorFiLM
+from gui_world_model.predictor_prob_film import VJ2GUIPredictorProbFiLM
 from gui_world_model.predictor_a_encoded import VJ2GUIPredictorActionEncoded
+from gui_world_model.predictor_noop import VJ2GUIPredictorNoOp
 from training.validators.input_sensitivity import InputSensitivityValidator
+from training.losses import MAELoss, LaplaceNLL
 from training.validators.film_gamma import FilmGammaValidator
 from training.validators.loss_distribution import LossDistributionValidator
+from training.validators.action_sensitivity import ActionSensitivityValidator
 from gui_world_model.utils.loading import load_model
 
 # from testing.model_info import analyze_my_model
@@ -31,13 +37,16 @@ MODEL_REGISTRY = {
     "vanilla": VJ2GUIPredictor,
     "cross_attention": VJ2GUIPredictorCrossAttention,
     "film": VJ2GUIPredictorFiLM,
+    "prob_film": VJ2GUIPredictorProbFiLM,
     "encode_a": VJ2GUIPredictorActionEncoded,
+    "noop": VJ2GUIPredictorNoOp,
 }
 
 VALIDATOR_REGISTRY = {
     "input_sensitivity": InputSensitivityValidator,
     "film_gamma": FilmGammaValidator,
     "loss_distribution": LossDistributionValidator,
+    "action_sensitivity": ActionSensitivityValidator,
 }
 
 logger = get_logger()
@@ -48,6 +57,19 @@ def _ddp_mean(x: float, device) -> float:
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     t /= dist.get_world_size()
     return float(t.item())
+
+def _get_model_source_path(model):
+    """Get the absolute path to the source file of the model's class."""
+    try:
+        # Get the class of the model instance
+        model_class = model.__class__
+        # Get the file where the class is defined
+        source_file = inspect.getsourcefile(model_class)
+        if source_file:
+            return Path(source_file).resolve()
+    except (TypeError, OSError) as e:
+        logger.warning(f"Could not get source file for model {model.__class__.__name__}: {e}")
+    return None
 
 class VJEPATrainer:
     def __init__(self, args, model):
@@ -73,6 +95,16 @@ class VJEPATrainer:
             self.predictor = DDP(self.predictor, device_ids=[args.local_rank])
         else:
             self.predictor = DDP(self.predictor)
+
+        # Loss registry and chosen loss function (supports probabilistic losses)
+        LOSS_REGISTRY = {
+            "mae": MAELoss,
+            "laplace_nll": LaplaceNLL,
+        }
+        loss_type = getattr(args, "loss_type", "mae")
+        if loss_type not in LOSS_REGISTRY:
+            raise ValueError(f"Unknown loss_type '{loss_type}'. Valid options: {list(LOSS_REGISTRY.keys())}")
+        self.loss_module = LOSS_REGISTRY[loss_type]().to(self.device)
 
         # model_stats = analyze_my_model(self.predictor, verbose=True)
         
@@ -176,6 +208,21 @@ class VJEPATrainer:
         if dist.get_rank() != 0:
             return
 
+        # --- Save Model Source Code ---
+        source_code_path = None
+        try:
+            model_source_file = _get_model_source_path(self.predictor.module)
+            if model_source_file:
+                source_dest_filename = f"vjepa_{self.model_type}_{tag}.py"
+                source_dest_path = self.run_dir / source_dest_filename
+                shutil.copy(model_source_file, source_dest_path)
+                source_code_path = source_dest_path.name # Store relative path
+                logger.info(f"💾 Saved model source code to {source_dest_path}")
+        except Exception as e:
+            logger.warning(f"⚠️  Could not save model source code: {e}")
+
+
+        # --- Save Checkpoint ---
         # Save predictor + optimizer + scheduler states when available
         config = self.predictor.module.get_config()
         config["model_type"] = self.model_type
@@ -185,6 +232,9 @@ class VJEPATrainer:
             "predictor": self.predictor.module.state_dict(),
             "predictor_config": config,
         }
+        if source_code_path:
+            ckpt["source_code_file"] = source_code_path
+
         if hasattr(self, "scaler") and self.scaler is not None:
             ckpt["scaler"] = self.scaler.state_dict()
         try:
@@ -370,17 +420,24 @@ class VJEPATrainer:
                     
                     # --- Run Validators ---
                     self.validation_cycle_count += 1
+                    validator_metrics = {}
                     if dist.get_rank() == 0 and self.validators:
                         logger.info("Running custom validators...")
+                        # Ensure validators always receive a deterministic tensor
+                        if hasattr(self.predictor.module, 'return_mean'):
+                            self.predictor.module.return_mean()
+
                         for validator in self.validators:
                             if validator.should_run(self.validation_cycle_count):
                                 try:
-                                    validator.run(
+                                    metrics = validator.run(
                                         model=self.predictor.module, # unwrap DDP
                                         validation_loader=self.validation_loader,
                                         device=self.device,
                                         global_step=self.global_step
                                     )
+                                    if metrics:
+                                        validator_metrics.update(metrics)
                                 except Exception as e:
                                     logger.error(f"Validator {type(validator).__name__} failed: {e}")
 
@@ -388,13 +445,16 @@ class VJEPATrainer:
                     print(f"[DDP] Rank {dist.get_rank()}: Exiting validation at epoch {epoch}, iter {itr}")
                     if dist.get_rank() == 0:
                         if self.validation_loader:
-                            wandb.log({
+                            # Consolidate all metrics into one log call
+                            log_payload = {
                                 "val/loss": val_loss,
                                 "val/jloss": val_jloss,
                                 "val/sloss": val_sloss,
                                 "best_val_loss": self.best_val_loss,
                                 "step": self.global_step,
-                            })
+                            }
+                            log_payload.update(validator_metrics)
+                            wandb.log(log_payload)
             self.current_loss = loss_meter.avg
             
             # Only save epoch-based checkpoints if explicitly requested (for backwards compatibility)
@@ -429,7 +489,7 @@ class VJEPATrainer:
         with autocast(device_type='cuda'):
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
             jloss = self.loss_fn(z_tf, h_all[:, 1:])
-            sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_all[:, self.rollout_horizon].unsqueeze(1))
+            sloss = self.loss_fn(z_ar_final, h_all[:, self.rollout_horizon].unsqueeze(1))
             return float(jloss + sloss), float(jloss), float(sloss)
 
     def train_step(self, sample):
@@ -443,7 +503,7 @@ class VJEPATrainer:
         with autocast(device_type='cuda'):
             z_tf, z_ar_final = self.forward_predictions(z_all, actions)
             jloss = self.loss_fn(z_tf, h_all[:, 1:])
-            sloss = self.loss_fn(z_ar_final.unsqueeze(1), h_all[:, self.rollout_horizon].unsqueeze(1))
+            sloss = self.loss_fn(z_ar_final, h_all[:, self.rollout_horizon].unsqueeze(1))
             loss = jloss + sloss
         
         # logger.info(f"Loss value before checking isfinite: {loss.item()}")
@@ -473,17 +533,35 @@ class VJEPATrainer:
             B, T_seq, _, _ = actions.shape
             formatted_actions = actions.view(B, T_seq, -1)
 
+        # Teacher forcing part
+        if hasattr(self.predictor.module, 'return_full'):
+            self.predictor.module.return_full()
         z_tf = self.predictor(z_all[:, :-1], formatted_actions)
 
-        z_rollout = z_all[:, 0].unsqueeze(1)
-        for i in range(self.rollout_horizon):
+        # Auto-regressive rollout part
+        if hasattr(self.predictor.module, 'return_mean'):
+            self.predictor.module.return_mean()
+        
+        next_z_input = z_all[:, 0].unsqueeze(1)
+        final_pred_rollout = None
+        for i in range(self.rollout_horizon-1):
             a = formatted_actions[:, i].unsqueeze(1)
-            z_rollout = self.predictor(z_rollout, a)
+            # The loop only propagates the deterministic tensor
+            next_z_input = self.predictor(next_z_input, a)
 
-        return z_tf, z_rollout.squeeze(1)
+        # After the mean-only rollout, get the final prediction with full distribution
+        if hasattr(self.predictor.module, 'return_full'):
+            self.predictor.module.return_full()
+        
+        # We pass the final state `next_z_input` and the corresponding action
+        # to get the full probabilistic output for the loss function.
+        final_pred_rollout = self.predictor(next_z_input, formatted_actions[:, self.rollout_horizon-1].unsqueeze(1))
+
+        return z_tf, final_pred_rollout
 
     def loss_fn(self, z_pred, h_target):
-        return torch.mean(torch.abs(z_pred - h_target) ** self.loss_exp) / self.loss_exp
+        # Delegate to the configured loss module (supports both point-estimate and probabilistic outputs)
+        return self.loss_module(z_pred, h_target)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified Trainer for V-JEPA Predictor Models")
@@ -501,7 +579,7 @@ if __name__ == "__main__":
     parser.add_argument("--load_checkpoint", type=str, default=None)
     
     # Validator arguments
-    parser.add_argument("--validators", nargs='*', default=[], choices=VALIDATOR_REGISTRY.keys(),
+    parser.add_argument("--validators", nargs='*', default=[], choices=list(VALIDATOR_REGISTRY.keys()),
                         help="List of validators to run during validation.")
     parser.add_argument("--validator_frequency", type=int, default=1,
                         help="Run validators every N validation cycles.")
@@ -527,6 +605,10 @@ if __name__ == "__main__":
     parser.add_argument("--film_d_a", type=int, default=32)
     parser.add_argument("--film_d_c", type=int, default=128)
     parser.add_argument("--film_layers_modulated", type=int, default=6)
+
+    # Loss choice
+    parser.add_argument("--loss_type", type=str, default="mae", choices=["mae", "laplace_nll"],
+                        help="Loss function to use: 'mae' (default) or 'laplace_nll' for probabilistic predictors")
 
     # Action-Encoded specific
     parser.add_argument("--frozen_action_encoder_checkpoint", type=str, default=None, help="Path to frozen CNN action encoder checkpoint for encode_a model")
@@ -567,6 +649,13 @@ if __name__ == "__main__":
 
     model = model_class(**model_args)
     
+    # Conditionally wrap the model if using a probabilistic loss
+    if args.loss_type == 'laplace_nll':
+        from gui_world_model.utils.prob_wrapper import ProbabilisticWrapper
+        model = ProbabilisticWrapper(model)
+        if dist.get_rank() == 0:
+            logger.info("Wrapped model in ProbabilisticWrapper for laplace_nll loss.")
+
     # --- Trainer Initialization and Execution ---
     trainer = VJEPATrainer(args, model)
     trainer.training_loop()
