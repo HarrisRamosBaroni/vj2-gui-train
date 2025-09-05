@@ -1,6 +1,19 @@
 import torch
 import os
 
+def clean_state_dict_keys(state_dict):
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("module."):
+            new_key = k[len("module."):]
+        elif k.startswith("model."):
+            new_key = k[len("model."):]
+        else:
+            new_key = k
+        new_state_dict[new_key] = v
+    return new_state_dict
+
+
 def load_model(
     model_path: str,
     device: torch.device,
@@ -78,11 +91,12 @@ def load_model(
         raise ValueError("Checkpoint is missing 'predictor' state dictionary.")
         
     state_dict = checkpoint["predictor"]
-
-    # Remove `module.` prefix if present (from DDP training)
-    new_state_dict = {
-        k.replace("module.", ""): v for k, v in state_dict.items()
-    }
+    
+    # # Remove `module.` prefix if present (from DDP training)
+    # new_state_dict = {
+    #     k.replace("module.", ""): v for k, v in state_dict.items()
+    # }
+    new_state_dict = clean_state_dict_keys(state_dict)
 
     model.load_state_dict(new_state_dict)
 

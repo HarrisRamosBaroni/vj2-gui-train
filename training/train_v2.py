@@ -183,6 +183,20 @@ class VJEPATrainer:
             self.run_dir = Path("resource/checkpoints") / run_dir_name
             self.run_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ensure probabilistic models are wrapped exactly once.
+        from gui_world_model.utils.prob_wrapper import ProbabilisticWrapper
+        if getattr(args, "loss_type", "mae") == "laplace_nll":
+            # self.predictor is DDP-wrapped; get inner module if present
+            predictor_module = getattr(self.predictor, "module", self.predictor)
+            if not isinstance(predictor_module, ProbabilisticWrapper):
+                wrapped = ProbabilisticWrapper(predictor_module).to(self.device)
+                if args.device_type == "cuda":
+                    self.predictor = DDP(wrapped, device_ids=[args.local_rank])
+                else:
+                    self.predictor = DDP(wrapped)
+                if dist.get_rank() == 0:
+                    logger.info("Wrapped model in ProbabilisticWrapper (trainer init).")
+
         self.validators = []
         if dist.get_rank() == 0 and args.validators:
             for validator_name in args.validators:
@@ -649,12 +663,14 @@ if __name__ == "__main__":
 
     model = model_class(**model_args)
     
-    # Conditionally wrap the model if using a probabilistic loss
-    if args.loss_type == 'laplace_nll':
-        from gui_world_model.utils.prob_wrapper import ProbabilisticWrapper
-        model = ProbabilisticWrapper(model)
-        if dist.get_rank() == 0:
-            logger.info("Wrapped model in ProbabilisticWrapper for laplace_nll loss.")
+    # Conditionally wrap the model if using a probabilistic loss.
+    # Avoid double-wrapping by checking the instance first.
+    # if args.loss_type == 'laplace_nll':
+    #     from gui_world_model.utils.prob_wrapper import ProbabilisticWrapper
+    #     if not isinstance(model, ProbabilisticWrapper):
+    #         model = ProbabilisticWrapper(model)
+    #         if dist.get_rank() == 0:
+    #             logger.info("Wrapped model in ProbabilisticWrapper for laplace_nll loss.")
 
     # --- Trainer Initialization and Execution ---
     trainer = VJEPATrainer(args, model)
