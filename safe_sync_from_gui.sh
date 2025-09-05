@@ -16,6 +16,7 @@ FILES_TO_SYNC=(
     "gui_world_model/predictor_film.py"
     "gui_world_model/predictor_noop.py"
     "gui_world_model/predictor_prob_film.py"
+    "conditioned_gesture_generator/"
     # "training/test/"
     "training/validators/"
     "training/__init__.py"
