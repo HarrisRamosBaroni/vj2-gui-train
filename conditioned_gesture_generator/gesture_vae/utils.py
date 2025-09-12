@@ -117,18 +117,22 @@ class CheckpointManager:
     """
     
     def __init__(self, checkpoint_dir: str, max_checkpoints: int = 5, 
-                 save_source: bool = True, num_elite: int = 3):
+                 save_source: bool = True, num_elite: int = 3, num_elite_ce: int = 3,
+                 training_args=None):
         """
         Args:
             checkpoint_dir: Directory to save checkpoints
             max_checkpoints: Maximum number of regular checkpoints to keep
             save_source: Whether to copy source code to checkpoint directory
-            num_elite: Number of elite models to keep based on validation score
+            num_elite: Number of elite models to keep based on total validation score (CE + KL)
+            num_elite_ce: Number of elite models to keep based on CE loss only
+            training_args: Training arguments object for auto-saving config
         """
         self.checkpoint_dir = checkpoint_dir
         self.max_checkpoints = max_checkpoints
         self.save_source = save_source
         self.num_elite = num_elite
+        self.num_elite_ce = num_elite_ce
         
         # Create checkpoint directory
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -138,18 +142,179 @@ class CheckpointManager:
         
         # Elite model tracking: list of (score, filepath, metadata) tuples
         # Lower scores are better (loss values)
-        self.elite_models = []
+        self.elite_models = []  # Based on total_loss (CE + KL)
+        self.elite_models_ce = []  # Based on CE loss only
         
         # Setup graceful interruption handling
         self._setup_signal_handler()
         self._training_state = None
         
+        # Auto-save complete model configuration if training_args provided
+        if training_args is not None:
+            self._save_complete_model_config(training_args)
+        
         # Copy source code if requested
         if save_source:
             self._copy_source_code()
+    
+    def _save_complete_model_config(self, training_args):
+        """Save complete model configuration as JSON for easy inference loading."""
+        import json
+        from datetime import datetime
+        
+        # Extract decoder channels (handle both list and None)
+        decoder_channels = getattr(training_args, 'decoder_channel', None)
+        if decoder_channels is None:
+            decoder_channels = [512, 384, 256, 128]  # Default from model
+        
+        # Build complete configuration
+        config = {
+            "model_architecture": "CNNCNNVAE",
+            "model_parameters": {
+                "d_latent": getattr(training_args, 'd_latent', 128),
+                "k_classes": getattr(training_args, 'k_classes', 3000),
+                "encoder_hidden_dim": getattr(training_args, 'hidden_dim', 256),
+                "decoder_hidden_dim": getattr(training_args, 'hidden_dim', 256),
+                "decoder_channels": decoder_channels,
+                "conv_kernel": 3,
+                "conv_stride": 2,
+                "use_output_padding": False
+            },
+            "training_parameters": {
+                "epochs": getattr(training_args, 'epochs', None),
+                "batch_size": getattr(training_args, 'batch_size', None),
+                "learning_rate": getattr(training_args, 'lr', None),
+                "beta": getattr(training_args, 'beta', None),
+                "kl_anneal": getattr(training_args, 'kl_anneal', None),
+                "val_interval": getattr(training_args, 'val_interval', None),
+                "num_workers": getattr(training_args, 'num_workers', None)
+            },
+            "data_path": getattr(training_args, 'data_path', None),
+            "training_command": self._reconstruct_training_command(training_args),
+            "checkpoint_info": {
+                "training_date": datetime.now().strftime("%Y-%m-%d"),
+                "training_start_time": datetime.now().strftime("%H:%M:%S"),
+                "checkpoint_directory": os.path.basename(self.checkpoint_dir)
+            },
+            "inference_usage": {
+                "python_code": f"from clean_inference import load_vae_from_config\nvae = load_vae_from_config('{os.path.basename(self.checkpoint_dir)}')",
+                "required_parameters": {
+                    "d_latent": getattr(training_args, 'd_latent', 128),
+                    "k_classes": getattr(training_args, 'k_classes', 3000),
+                    "hidden_dim": getattr(training_args, 'hidden_dim', 256),
+                    "decoder_channels": decoder_channels
+                }
+            },
+            "notes": {
+                "architecture": "CNN encoder + CNN decoder with VAE latent space",
+                "sequence_length": 250,
+                "coordinate_dimensions": 2,
+                "coordinate_range": "[0, 1]",
+                "quantization": "Coordinates are quantized into k_classes discrete values"
+            }
+        }
+        
+        # Save config file
+        config_path = os.path.join(self.checkpoint_dir, 'model_config.json')
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        print(f"📝 Model configuration saved: {config_path}")
+    
+    def _reconstruct_training_command(self, training_args):
+        """Reconstruct the training command from args."""
+        cmd_parts = ["-m conditioned_gesture_generator.gesture_vae.train_cnn_cnn"]
+        
+        # Add important arguments
+        if hasattr(training_args, 'data_path'):
+            cmd_parts.append(f"--data_path {training_args.data_path}")
+        if hasattr(training_args, 'd_latent'):
+            cmd_parts.append(f"--d_latent {training_args.d_latent}")
+        if hasattr(training_args, 'hidden_dim'):
+            cmd_parts.append(f"--hidden_dim {training_args.hidden_dim}")
+        if hasattr(training_args, 'k_classes'):
+            cmd_parts.append(f"--k_classes {training_args.k_classes}")
+        if hasattr(training_args, 'epochs'):
+            cmd_parts.append(f"--epochs {training_args.epochs}")
+        if hasattr(training_args, 'kl_anneal'):
+            cmd_parts.append(f"--kl_anneal {training_args.kl_anneal}")
+        if hasattr(training_args, 'beta'):
+            cmd_parts.append(f"--beta {training_args.beta}")
+        if hasattr(training_args, 'val_interval'):
+            cmd_parts.append(f"--val_interval {training_args.val_interval}")
+        if hasattr(training_args, 'decoder_channel'):
+            channels = ' '.join(map(str, training_args.decoder_channel))
+            cmd_parts.append(f"--decoder_channel {channels}")
+        if hasattr(training_args, 'batch_size'):
+            cmd_parts.append(f"--batch_size {training_args.batch_size}")
+        if hasattr(training_args, 'num_workers'):
+            cmd_parts.append(f"--num_workers {training_args.num_workers}")
+        
+        return ' '.join(cmd_parts)
+    
+    @staticmethod
+    def load_model_from_config(checkpoint_path: str, device: str = 'auto'):
+        """
+        Load model from checkpoint file using model_config.json in the same directory.
+        
+        Args:
+            checkpoint_path: Path to the .pt checkpoint file
+            device: Device to use ('auto', 'cpu', 'cuda')
+            
+        Returns:
+            Loaded VAE model ready for inference
+        """
+        import json
+        import torch
+        from pathlib import Path
+        
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_dir = checkpoint_path.parent
+        
+        # Auto-detect device
+        if device == 'auto':
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device(device)
+        
+        # Load config from the same directory
+        config_path = checkpoint_dir / "model_config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"model_config.json not found in {checkpoint_dir}")
+        
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Extract model parameters
+        params = config["model_parameters"]
+        
+        # Import and create model
+        from conditioned_gesture_generator.gesture_vae.model_cnn_cnn import CNNCNNVAE
+        model = CNNCNNVAE(
+            d_latent=params["d_latent"],
+            k_classes=params["k_classes"],
+            encoder_hidden_dim=params["encoder_hidden_dim"],
+            decoder_hidden_dim=params["decoder_hidden_dim"],
+            decoder_channels=params["decoder_channels"]
+        )
+        
+        # Load the specific checkpoint
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        model.to(device)
+        model.eval()
+        
+        print(f"✅ Model loaded from: {checkpoint_path}")
+        print(f"   Config: {config_path}")
+        print(f"   Parameters: d_latent={params['d_latent']}, k_classes={params['k_classes']}")
+        print(f"   Device: {device}")
+        
+        return model
             
         # Load existing elite models if resuming
         self._load_existing_elite_models()
+        self._load_existing_elite_models_ce()
     
     def _setup_signal_handler(self):
         """Setup signal handler for graceful interruption (Ctrl+C)."""
@@ -433,11 +598,46 @@ class CheckpointManager:
         self.elite_models.sort(key=lambda x: x[0])
         
         if self.elite_models:
-            print(f"Loaded {len(self.elite_models)} existing elite models:")
+            print(f"Loaded {len(self.elite_models)} existing elite models (total_loss):")
             for i, (score, filepath, metadata) in enumerate(self.elite_models):
                 basename = os.path.basename(filepath)
                 epoch = metadata.get('epoch', 'unknown')
                 print(f"  {i+1}. {basename} - Score: {score:.6f} (Epoch {epoch})")
+    
+    def _load_existing_elite_models_ce(self):
+        """Load existing CE-elite models from checkpoint directory when resuming."""
+        import glob
+        
+        # Look for CE-elite checkpoint files
+        elite_pattern = os.path.join(self.checkpoint_dir, 'elite_ce_*.pt')
+        elite_files = glob.glob(elite_pattern)
+        
+        for elite_file in elite_files:
+            try:
+                # Load checkpoint to get CE score
+                checkpoint = torch.load(elite_file, map_location='cpu')
+                if 'val_metrics' in checkpoint and checkpoint['val_metrics']:
+                    # Get CE loss (reconstruction loss)
+                    score = checkpoint['val_metrics'].get('recon_loss', float('inf'))
+                    metadata = {
+                        'epoch': checkpoint.get('epoch', 0),
+                        'timestamp': checkpoint.get('timestamp', 'unknown'),
+                        'train_metrics': checkpoint.get('train_metrics', {}),
+                        'val_metrics': checkpoint.get('val_metrics', {})
+                    }
+                    self.elite_models_ce.append((score, elite_file, metadata))
+            except Exception as e:
+                print(f"Warning: Could not load CE-elite checkpoint {elite_file}: {e}")
+        
+        # Sort by score (lower is better)
+        self.elite_models_ce.sort(key=lambda x: x[0])
+        
+        if self.elite_models_ce:
+            print(f"Loaded {len(self.elite_models_ce)} existing elite models (CE only):")
+            for i, (score, filepath, metadata) in enumerate(self.elite_models_ce):
+                basename = os.path.basename(filepath)
+                epoch = metadata.get('epoch', 'unknown')
+                print(f"  {i+1}. {basename} - CE Score: {score:.6f} (Epoch {epoch})")
     
     def save_elite_model(self, model, optimizer, epoch: int, val_score: float,
                         train_metrics: Dict[str, float], val_metrics: Dict[str, float],
@@ -516,9 +716,86 @@ class CheckpointManager:
         
         return False
     
+    def save_elite_model_ce(self, model, optimizer, epoch: int, ce_score: float,
+                           train_metrics: Dict[str, float], val_metrics: Dict[str, float],
+                           scheduler=None, step_counter: int = 0, steps_per_epoch: int = None):
+        """
+        Save model if it qualifies as elite based on CE (reconstruction) score only.
+        
+        Args:
+            model: PyTorch model
+            optimizer: Optimizer
+            epoch: Current epoch
+            ce_score: CE/reconstruction loss score (lower is better)
+            train_metrics: Training metrics
+            val_metrics: Validation metrics
+            scheduler: Optional scheduler
+            step_counter: Current step
+            steps_per_epoch: Steps per epoch
+        
+        Returns:
+            bool: True if model was saved as CE-elite, False otherwise
+        """
+        # Check if this model qualifies as CE-elite
+        if self._is_elite_ce(ce_score):
+            # Create CE-elite checkpoint
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_metrics': train_metrics,
+                'val_metrics': val_metrics,
+                'timestamp': datetime.now().isoformat(),
+                'step_counter': step_counter,
+                'best_ce_loss': ce_score,
+                'steps_per_epoch': steps_per_epoch,
+                'elite_ce_rank': len([x for x in self.elite_models_ce if x[0] < ce_score]) + 1,
+                'model_config': {
+                    'd_latent': getattr(model, 'd_latent', None),
+                    'k_classes': getattr(model, 'k_classes', None),
+                }
+            }
+            
+            # Add scheduler state if provided
+            if scheduler is not None:
+                checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+            
+            # Generate CE-elite filename
+            elite_filename = f'elite_ce_{epoch:04d}_score_{ce_score:.6f}.pt'
+            elite_path = os.path.join(self.checkpoint_dir, elite_filename)
+            
+            # Save checkpoint
+            torch.save(checkpoint, elite_path)
+            
+            # Update CE-elite tracking
+            metadata = {
+                'epoch': epoch,
+                'timestamp': checkpoint['timestamp'],
+                'train_metrics': train_metrics,
+                'val_metrics': val_metrics
+            }
+            
+            self.elite_models_ce.append((ce_score, elite_path, metadata))
+            self.elite_models_ce.sort(key=lambda x: x[0])  # Sort by CE score
+            
+            # Remove excess CE-elite models
+            self._cleanup_elite_models_ce()
+            
+            # Determine rank
+            current_rank = next(i for i, (score, _, _) in enumerate(self.elite_models_ce) 
+                              if score == ce_score) + 1
+            
+            print(f"🎯 CE-Elite model saved! Rank: {current_rank}/{len(self.elite_models_ce)}")
+            print(f"   CE Score: {ce_score:.6f}, Epoch: {epoch}")
+            print(f"   File: {os.path.basename(elite_path)}")
+            
+            return True
+        
+        return False
+    
     def _is_elite(self, val_score: float) -> bool:
         """
-        Check if a validation score qualifies as elite.
+        Check if a validation score qualifies as elite (total loss).
         
         Args:
             val_score: Validation score to check
@@ -533,6 +810,23 @@ class CheckpointManager:
         worst_elite_score = self.elite_models[-1][0]
         return val_score < worst_elite_score
     
+    def _is_elite_ce(self, ce_score: float) -> bool:
+        """
+        Check if a CE score qualifies as elite (CE only).
+        
+        Args:
+            ce_score: CE loss score to check
+            
+        Returns:
+            bool: True if score qualifies as elite
+        """
+        if len(self.elite_models_ce) < self.num_elite_ce:
+            return True
+        
+        # Check if score is better than the worst elite
+        worst_elite_score = self.elite_models_ce[-1][0]
+        return ce_score < worst_elite_score
+    
     def _cleanup_elite_models(self):
         """Remove excess elite models, keeping only the best num_elite."""
         if len(self.elite_models) > self.num_elite:
@@ -542,16 +836,32 @@ class CheckpointManager:
             for score, filepath, metadata in models_to_remove:
                 try:
                     os.remove(filepath)
-                    print(f"Removed elite checkpoint: {os.path.basename(filepath)} (score: {score:.6f})")
+                    print(f"Removed elite checkpoint: {os.path.basename(filepath)} (total_loss: {score:.6f})")
                 except OSError as e:
                     print(f"Warning: Could not remove {filepath}: {e}")
             
             # Keep only the best models
             self.elite_models = self.elite_models[:self.num_elite]
     
+    def _cleanup_elite_models_ce(self):
+        """Remove excess CE-elite models, keeping only the best num_elite_ce."""
+        if len(self.elite_models_ce) > self.num_elite_ce:
+            # Remove worst models
+            models_to_remove = self.elite_models_ce[self.num_elite_ce:]
+            
+            for score, filepath, metadata in models_to_remove:
+                try:
+                    os.remove(filepath)
+                    print(f"Removed CE-elite checkpoint: {os.path.basename(filepath)} (CE loss: {score:.6f})")
+                except OSError as e:
+                    print(f"Warning: Could not remove {filepath}: {e}")
+            
+            # Keep only the best models
+            self.elite_models_ce = self.elite_models_ce[:self.num_elite_ce]
+    
     def get_elite_models_info(self) -> List[Dict]:
         """
-        Get information about current elite models.
+        Get information about current elite models (total loss).
         
         Returns:
             List of dictionaries with elite model information
@@ -571,15 +881,48 @@ class CheckpointManager:
         
         return elite_info
     
+    def get_elite_models_ce_info(self) -> List[Dict]:
+        """
+        Get information about current CE-elite models.
+        
+        Returns:
+            List of dictionaries with CE-elite model information
+        """
+        elite_info = []
+        for rank, (score, filepath, metadata) in enumerate(self.elite_models_ce, 1):
+            info = {
+                'rank': rank,
+                'ce_score': score,
+                'filepath': filepath,
+                'filename': os.path.basename(filepath),
+                'epoch': metadata.get('epoch', 'unknown'),
+                'timestamp': metadata.get('timestamp', 'unknown'),
+                'exists': os.path.exists(filepath)
+            }
+            elite_info.append(info)
+        
+        return elite_info
+    
     def get_best_elite_model(self) -> Optional[str]:
         """
-        Get the path to the best elite model.
+        Get the path to the best elite model (total loss).
         
         Returns:
             Path to best elite model or None if no elite models exist
         """
         if self.elite_models:
             return self.elite_models[0][1]  # First element has the best score
+        return None
+    
+    def get_best_elite_model_ce(self) -> Optional[str]:
+        """
+        Get the path to the best CE-elite model.
+        
+        Returns:
+            Path to best CE-elite model or None if no CE-elite models exist
+        """
+        if self.elite_models_ce:
+            return self.elite_models_ce[0][1]  # First element has the best CE score
         return None
     
     def find_latest_checkpoint(self, checkpoint_dir: str = None) -> str:
@@ -1124,7 +1467,7 @@ class ExperimentLogger:
     
     def _split_trajectory_at_zeros(self, coords):
         """
-        Split trajectory into continuous segments, breaking at zero coordinates (pen lifts).
+        Split trajectory into continuous segments, filtering out points where x=0 OR y=0.
         
         Args:
             coords: numpy array of shape [T, 2] with x,y coordinates
@@ -1136,14 +1479,14 @@ class ExperimentLogger:
         current_segment = []
         
         for i, point in enumerate(coords):
-            # Check if point is a pen lift (both x and y are zero)
-            if point[0] == 0 and point[1] == 0:
+            # Filter out points where x=0 OR y=0 (only plot when both are non-zero)
+            if point[0] == 0 or point[1] == 0:
                 # End current segment if it has points
                 if len(current_segment) > 0:
                     segments.append(np.array(current_segment))
                     current_segment = []
             else:
-                # Add non-zero point to current segment
+                # Add point where both x and y are non-zero
                 current_segment.append(point)
         
         # Add final segment if it has points

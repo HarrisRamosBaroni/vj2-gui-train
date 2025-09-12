@@ -46,7 +46,9 @@ def load_model(
         raise FileNotFoundError(f"Checkpoint file not found at {model_path}")
 
     print(f"Loading model from: {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
+    # Allow LayerNorm for PyTorch 2.6+ compatibility
+    torch.serialization.add_safe_globals([torch.nn.LayerNorm])
+    checkpoint = torch.load(model_path, map_location=device, weights_only=True)
 
     # --- 1. Infer Model Type if not provided ---
     if model_type is None:

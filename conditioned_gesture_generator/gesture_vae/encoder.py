@@ -4,6 +4,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ResidualBlock1D(nn.Module):
+    """
+    Residual block for 1D convolutions with skip connections.
+    Helps with training stability and gradient flow.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            in_channels, out_channels, kernel_size,
+            padding=(kernel_size - 1) * dilation // 2,
+            dilation=dilation
+        )
+        self.norm = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Project input if channel count differs
+        self.proj = nn.Conv1d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+    
+    def forward(self, x):
+        residual = self.proj(x)
+        out = self.conv(x)
+        out = self.norm(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        return out + residual
+
+
 class CNNEncoder(nn.Module):
     """
     CNN-based encoder matching the CNN gesture classifier architecture.
@@ -23,7 +51,7 @@ class CNNEncoder(nn.Module):
         self.hidden_dim = hidden_dim
         
         # CNN Encoder layers with dilated convolutions (stride=1, preserving length)
-        # Matches CNN gesture classifier exactly
+        # Now using residual blocks for better gradient flow and training stability
         encoder_channels = [64, 128, 256, 512]
         kernel_size = 5
         
@@ -32,14 +60,9 @@ class CNNEncoder(nn.Module):
         
         for i, out_channels in enumerate(encoder_channels):
             dilation = 2 ** i  # Increasing dilation: 1, 2, 4, 8
-            padding = (kernel_size - 1) * dilation // 2  # Maintain same output length
-            self.encoder_layers.append(nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size, stride=1, 
-                         padding=padding, dilation=dilation),
-                nn.BatchNorm1d(out_channels),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout)
-            ))
+            self.encoder_layers.append(
+                ResidualBlock1D(in_channels, out_channels, kernel_size, dilation, dropout)
+            )
             in_channels = out_channels
         
         # Calculate flattened dimension (sequence length preserved)

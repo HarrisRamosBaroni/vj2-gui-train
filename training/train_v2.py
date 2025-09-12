@@ -22,8 +22,10 @@ from gui_world_model.predictor import VJ2GUIPredictor
 from gui_world_model.predictor_cross_attention import VJ2GUIPredictor as VJ2GUIPredictorCrossAttention
 from gui_world_model.predictor_film import VJ2GUIPredictorFiLM
 from gui_world_model.predictor_prob_film import VJ2GUIPredictorProbFiLM
+from gui_world_model.predictor_prob import VJ2GUIPredictorProb
 from gui_world_model.predictor_a_encoded import VJ2GUIPredictorActionEncoded
 from gui_world_model.predictor_noop import VJ2GUIPredictorNoOp
+from gui_world_model.predictor_additive import VJ2GUIPredictorAdditive
 from training.validators.input_sensitivity import InputSensitivityValidator
 from training.losses import MAELoss, LaplaceNLL
 from training.validators.film_gamma import FilmGammaValidator
@@ -38,8 +40,10 @@ MODEL_REGISTRY = {
     "cross_attention": VJ2GUIPredictorCrossAttention,
     "film": VJ2GUIPredictorFiLM,
     "prob_film": VJ2GUIPredictorProbFiLM,
+    "prob_vanilla": VJ2GUIPredictorProb,
     "encode_a": VJ2GUIPredictorActionEncoded,
     "noop": VJ2GUIPredictorNoOp,
+    "additive": VJ2GUIPredictorAdditive,
 }
 
 VALIDATOR_REGISTRY = {
@@ -320,7 +324,9 @@ class VJEPATrainer:
             self.predictor = DDP(model)
 
         # --- 2. Load Training-Specific States (Optimizer, Schedulers, etc.) ---
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        # Allow LayerNorm for PyTorch 2.6+ compatibility
+        torch.serialization.add_safe_globals([torch.nn.LayerNorm])
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
 
         # Re-initialize optimizers with the new model's parameters
         self.optimizer, self.scheduler, self.wd_scheduler = init_opt(

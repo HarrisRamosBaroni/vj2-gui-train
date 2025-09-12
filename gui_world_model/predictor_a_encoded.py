@@ -24,84 +24,53 @@ from config import (
 )
 
 # Import CNN Gesture Classifier for frozen action encoder
-from conditioned_gesture_generator.cnn_gesture_classifier import CNNGestureClassifier
+from conditioned_gesture_generator.gesture_vae.utils import CheckpointManager
 
-class FrozenCNNActionEncoder(nn.Module):
+class FrozenVAEActionEncoder(nn.Module):
     """
-    Frozen CNN-based action encoder that embeds CNN weights directly as non-trainable buffers.
+    Frozen VAE-based action encoder that loads a pretrained CNNCNNVAE model
+    for inference and keeps it frozen.
     """
     
     def __init__(self, checkpoint_path, device='cuda'):
         super().__init__()
         
-        # Load pretrained CNN gesture classifier
-        print(f"Loading frozen CNN action encoder from: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # Load pretrained VAE model using the CheckpointManager
+        print(f"Loading frozen VAE action encoder from: {checkpoint_path}")
+        self.vae_model = CheckpointManager.load_model_from_config(checkpoint_path, device)
         
-        # Extract config from checkpoint
-        if 'config' not in checkpoint:
-            raise ValueError(f"Checkpoint {checkpoint_path} missing config. Ensure it was saved with model config.")
-        
-        config = checkpoint['config']
-        print(f"CNN Encoder config: {config}")
-        
-        # Create CNN gesture classifier with exact same architecture
-        self.cnn_classifier = CNNGestureClassifier(
-            input_dim=2,  # Only x, y coordinates
-            sequence_length=config['sequence_length'],
-            latent_dim=config['latent_dim'],
-            num_classes=config['num_classes'],
-            encoder_channels=config['encoder_channels'],
-            decoder_channels=config['decoder_channels'],
-        )
-        
-        # Load pretrained weights
-        if 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
-            
-        self.cnn_classifier.load_state_dict(state_dict)
-        
-        # Store config for saving/loading
-        self.cnn_config = config
-        
-        # Freeze all parameters by converting to non-trainable buffers
-        # This ensures weights are saved with predictor but not trained
-        for name, param in self.cnn_classifier.named_parameters():
-            # Replace dots with underscores for valid buffer names
-            buffer_name = f'frozen_cnn_{name.replace(".", "_")}'
-            self.register_buffer(buffer_name, param.data.clone())
+        # Freeze all parameters
+        for param in self.vae_model.parameters():
             param.requires_grad = False
         
-        self.cnn_classifier.eval()
+        self.vae_model.eval()
         
         # Store dimensions for reference
-        self.latent_dim = config['latent_dim']
-        self.sequence_length = config['sequence_length']
+        self.latent_dim = self.vae_model.d_latent
+        self.sequence_length = 250
         
-        print(f"✅ Frozen CNN action encoder loaded successfully")
+        print(f"✅ Frozen VAE action encoder loaded successfully")
         print(f"   Latent dim: {self.latent_dim}")
         print(f"   Sequence length: {self.sequence_length}")
-        print(f"   Frozen parameters: {sum(p.numel() for p in self.cnn_classifier.parameters())}")
+        print(f"   Frozen parameters: {sum(p.numel() for p in self.vae_model.parameters())}")
     
     def forward(self, gesture_coords):
         """
-        Encode gesture coordinates to latent vectors using frozen CNN encoder.
+        Encode gesture coordinates to latent vectors using the frozen VAE encoder.
         
         Args:
             gesture_coords: [B, T=250, 2] gesture coordinates (x, y only)
             
         Returns:
-            latent: [B, latent_dim] encoded latent vector
+            latent: [B, latent_dim] encoded latent vector (mean of the distribution)
         """
         with torch.no_grad():  # Ensure no gradients
-            latent = self.cnn_classifier.encode(gesture_coords)
-        return latent
+            mu, log_sigma = self.vae_model.encode(gesture_coords)
+        return mu
     
     def get_config(self):
-        """Return CNN configuration for saving."""
-        return self.cnn_config
+        """Return VAE configuration for saving."""
+        return {"vae_checkpoint_path": "loaded_dynamically"}
 
 
 class VJ2GUIPredictorActionEncoded(nn.Module):
@@ -149,7 +118,7 @@ class VJ2GUIPredictorActionEncoded(nn.Module):
         wide_silu=True,
         use_activation_checkpointing=False,
         use_rope=True,
-        frozen_action_encoder_checkpoint=None,  # Path to CNN gesture classifier checkpoint
+        frozen_action_encoder_checkpoint=None,  # Path to VAE checkpoint
         device=None
     ):
         super().__init__()
@@ -167,13 +136,13 @@ class VJ2GUIPredictorActionEncoded(nn.Module):
         # Token embeddings
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim)
         
-        # Initialize frozen CNN action encoder
+        # Initialize frozen VAE action encoder
         if frozen_action_encoder_checkpoint is None:
             raise ValueError("frozen_action_encoder_checkpoint must be provided")
             
-        self.frozen_action_encoder = FrozenCNNActionEncoder(frozen_action_encoder_checkpoint, self.device)
+        self.frozen_action_encoder = FrozenVAEActionEncoder(frozen_action_encoder_checkpoint, self.device)
         
-        # Action projection layer: CNN latent dim → predictor embed dim
+        # Action projection layer: VAE latent dim → predictor embed dim
         self.action_projection = nn.Linear(self.frozen_action_encoder.latent_dim, predictor_embed_dim)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -349,8 +318,13 @@ def load_predictor_a_encoded_model(model_path, device):
 
     # Remove `module.` prefix if present from DDP training
     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    
+    # Filter out frozen action encoder buffers from the state dict
+    # as they are loaded by the FrozenVAEActionEncoder class itself
+    filtered_state_dict = {k: v for k, v in new_state_dict.items() if not k.startswith('frozen_action_encoder.vae_model')}
 
-    model.load_state_dict(new_state_dict)
+
+    model.load_state_dict(filtered_state_dict, strict=False)
     model.eval()
     model.requires_grad_(False)
     print("✅ Action-encoded predictor loaded successfully.")
@@ -359,46 +333,52 @@ def load_predictor_a_encoded_model(model_path, device):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--log', default='info', choices=['debug', 'info', 'warning', 'error', 'critical'])
-    parser.add_argument('--cnn_checkpoint', type=str, required=True, 
-                       help='Path to CNN gesture classifier checkpoint')
+    parser.add_argument('--vae_checkpoint', type=str, required=True,
+                       help='Path to VAE model checkpoint (.pt file)')
     args = parser.parse_args()
-    logging.basicConfig(level=getattr(logging, args.log.upper()))    
+    logging.basicConfig(level=getattr(logging, args.log.upper()))
 
-    encoder = VJEPA2Wrapper(num_frames=16)
-    predictor = VJ2GUIPredictorActionEncoded(
-        num_frames=16, 
-        frozen_action_encoder_checkpoint=args.cnn_checkpoint
-    ).to(encoder.device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Test with structured action data
-    from torchvision import transforms
-    from device_control.screen_capture import capture_screen
-    NUM_CONTEXT_FRAMES = 16
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    normalize_mean = [0.485, 0.456, 0.406]
-    normalize_std = [0.229, 0.224, 0.225]
-    preprocess = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=normalize_mean, std=normalize_std)
-    ])
+    # --- Test instantiation ---
+    print("--- Testing Predictor Instantiation ---")
+    try:
+        predictor = VJ2GUIPredictorActionEncoded(
+            num_frames=16,
+            frozen_action_encoder_checkpoint=args.vae_checkpoint,
+            device=device
+        ).to(device)
+        print("✅ Predictor instantiated successfully.")
+    except Exception as e:
+        print(f"❌ Failed to instantiate predictor: {e}")
+        raise
 
-    buffer = []
-    while len(buffer) < NUM_CONTEXT_FRAMES:
-        frame = capture_screen()
-        tensor = preprocess(frame).to(DEVICE)
-        buffer.append(tensor)
-    video_tensor = torch.stack(buffer, dim=0).unsqueeze(0)
-    print(f"{video_tensor.shape=}")
+    # --- Test with dummy data ---
+    print("\n--- Testing Forward Pass with Dummy Data ---")
+    try:
+        encoder = VJEPA2Wrapper(num_frames=16, device=device)
+        
+        # Create dummy visual tokens
+        z_all = torch.randn(1, 8, 256, 1024).to(device) # B, T, N, D
+        B, T, N, D = z_all.shape
+        
+        # Create dummy action tensor
+        actions = torch.rand(B, T, 250, 3).to(device)
 
-    z_all = encoder(video_tensor)  # [1, 16, 256, 1024]
-    B, T, N, D = z_all.shape # T = 8 (reduced from 16 to 8 by tubelet = 2)
-    
-    # Create structured action tensor: [B, T, 250, 3]
-    actions = torch.rand(B, T, 250, 3).to(z_all.device)  # Random normalized coordinates
+        print(f"Visual tokens shape      (z): {z_all.shape}")
+        print(f"Structured actions shape (a): {actions.shape}")
 
-    print(f"Visual tokens shape      (z): {z_all.shape}")
-    print(f"Structured actions shape (a): {actions.shape}")
+        # Perform forward pass
+        z_pred = predictor(z_all, actions)
+        
+        print(f"✅ Forward pass successful.")
+        print(f"Predicted tokens shape (z_pred): {z_pred.shape}")
+        
+        # Verify output shape
+        assert z_pred.shape == z_all.shape, \
+            f"Output shape mismatch! Expected {z_all.shape}, got {z_pred.shape}"
+        print("✅ Output shape verified.")
 
-    z_pred = predictor(z_all, actions)
-    print(f"Predicted tokens shape: {z_pred.shape}")
+    except Exception as e:
+        print(f"❌ Forward pass test failed: {e}")
+        raise

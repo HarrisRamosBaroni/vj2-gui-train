@@ -2,6 +2,33 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+
+class ResidualTransposeBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, dropout):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.ConvTranspose1d(
+                in_channels, out_channels, kernel_size, stride, padding,
+                output_padding=0  # assuming clean doubling, as in your design
+            ),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout)
+        )
+        # For the shortcut, we need to handle both channel and spatial dimension changes
+        # Use interpolation for spatial upsampling to ensure exact size match
+        if in_channels != out_channels or stride != 1:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=1, padding=0),
+                nn.Upsample(scale_factor=stride, mode='linear', align_corners=False)
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        return self.main(x) + self.shortcut(x)
 
 
 def create_latent_expansion(d_latent, hidden_dim, output_size, dropout=0.1):
@@ -25,6 +52,109 @@ def create_latent_expansion(d_latent, hidden_dim, output_size, dropout=0.1):
         nn.Dropout(dropout),
         nn.Linear(2 * hidden_dim, output_size)
     )
+
+
+class SeededCNNDecoder(nn.Module):
+    """
+    Seeded CNN decoder that generates gestures from a tiled latent seed pattern.
+    
+    The decoder is called "Seeded" because it creates a tiled pattern by repeating
+    the latent vector across all timesteps, acting as a seed that is then modulated
+    by positional encoding and refined through dilated convolutions.
+    
+    Takes latent vector [B, d_latent] and outputs classification logits [B, 250, 2, k_classes].
+    Uses repeat (tiling) + positional encoding + dilated conv stack with axis-specific heads.
+    """
+    
+    def __init__(self, d_latent=124, k_classes=5000, feature_dim=256, num_layers=8):
+        """
+        Args:
+            d_latent: Dimension of the latent space (default: 124)
+            k_classes: Number of quantization classes for coordinate prediction (default: 5000)
+            feature_dim: Hidden feature dimension (default: 256)
+            num_layers: Number of dilated conv layers (default: 8)
+        """
+        super().__init__()
+        self.d_latent = d_latent
+        self.k_classes = k_classes
+        self.feature_dim = feature_dim
+        self.num_layers = num_layers
+        self.sequence_length = 250
+        
+        # Linear projection from latent to features
+        self.latent_proj = nn.Linear(d_latent, feature_dim)
+        
+        # Learned positional encoding
+        self.positional_encoding = nn.Parameter(torch.randn(1, feature_dim, self.sequence_length) * 0.02)
+        
+        # Dilated conv stack with exponentially increasing dilation
+        self.conv_stack = nn.ModuleList()
+        for i in range(num_layers):
+            dilation = 2 ** i  # 1, 2, 4, 8, 16, 32, 64, 128
+            self.conv_stack.append(nn.Sequential(
+                nn.Conv1d(feature_dim, feature_dim, kernel_size=3, dilation=dilation, padding=dilation),
+                nn.GroupNorm(1, feature_dim),
+                nn.GELU()
+            ))
+        
+        # Axis embeddings for x and y
+        self.axis_embedding = nn.Parameter(torch.randn(2, feature_dim) * 0.02)
+        
+        # Output heads for x and y predictions
+        self.x_head = nn.Conv1d(feature_dim, k_classes, kernel_size=1)
+        self.y_head = nn.Conv1d(feature_dim, k_classes, kernel_size=1)
+        
+    def forward(self, z):
+        """
+        Forward pass through the decoder.
+        
+        Args:
+            z: Latent vector of shape [B, d_latent]
+            
+        Returns:
+            logits: Classification logits of shape [B, 250, 2, k_classes]
+        """
+        B = z.shape[0]
+        
+        # Project latent to features [B, feature_dim]
+        features = self.latent_proj(z)
+        
+        # Repeat along time dimension [B, feature_dim, 250]
+        features = features.unsqueeze(-1).expand(-1, -1, self.sequence_length)
+        
+        # Add positional encoding
+        features = features + self.positional_encoding
+        
+        # Apply dilated conv stack with residual connections
+        for conv_layer in self.conv_stack:
+            features = features + conv_layer(features)
+        
+        # Create axis-specific features by adding axis embeddings
+        # features: [B, feature_dim, 250]
+        # axis_embedding: [2, feature_dim]
+        
+        # Process x-axis
+        x_features = features + self.axis_embedding[0].unsqueeze(-1)  # [B, feature_dim, 250]
+        x_logits = self.x_head(x_features)  # [B, k_classes, 250]
+        
+        # Process y-axis
+        y_features = features + self.axis_embedding[1].unsqueeze(-1)  # [B, feature_dim, 250]
+        y_logits = self.y_head(y_features)  # [B, k_classes, 250]
+        
+        # Transpose to [B, 250, k_classes] and stack for [B, 250, 2, k_classes]
+        x_logits = x_logits.transpose(1, 2)  # [B, 250, k_classes]
+        y_logits = y_logits.transpose(1, 2)  # [B, 250, k_classes]
+        
+        logits = torch.stack([x_logits, y_logits], dim=2)  # [B, 250, 2, k_classes]
+        
+        return logits
+    
+    def decode(self, z):
+        """
+        Decode latent vector to classification logits.
+        Alias for forward pass.
+        """
+        return self.forward(z)
 
 
 class CNNDecoder(nn.Module):
@@ -69,24 +199,14 @@ class CNNDecoder(nn.Module):
         output_size = decoder_channels[0] * self.decoder_initial_length
         self.latent_to_features = create_latent_expansion(d_latent, hidden_dim, output_size, dropout)
         
-        # CNN Decoder layers (ConvTranspose1d with configurable kernel/stride)
+        # CNN Decoder layers using Upsample + Conv1d for stable upsampling
         self.decoder_layers = nn.ModuleList()
         in_channels = decoder_channels[0]
         
         for i, out_channels in enumerate(decoder_channels[1:]):
-            # Use kernel=4, stride=2, padding=1 for clean doubling without checkerboard artifacts
-            # This ensures even kernel coverage: each output position gets exactly 2 kernel hits
-            padding = 1
-            output_padding = 0  # Not needed with proper kernel/stride/padding combo
-            
             self.decoder_layers.append(nn.Sequential(
-                nn.ConvTranspose1d(
-                    in_channels, out_channels, 
-                    kernel_size=conv_kernel, 
-                    stride=conv_stride, 
-                    padding=padding,
-                    output_padding=output_padding
-                ),
+                nn.Upsample(scale_factor=2, mode='linear', align_corners=False),
+                nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1),
                 nn.BatchNorm1d(out_channels),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout)
@@ -195,14 +315,17 @@ class LightweightCNNDecoder(nn.Module):
         )
         
         self.deconv_layers = nn.Sequential(
-            # 32 → 64 (clean doubling with kernel=4, stride=2, padding=1)
-            nn.ConvTranspose1d(hidden_dim, hidden_dim//2, kernel_size=4, stride=2, padding=1),
+            # 32 → 64 (using Upsample + Conv1d for stable upsampling)
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=False),
+            nn.Conv1d(hidden_dim, hidden_dim//2, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             # 64 → 128
-            nn.ConvTranspose1d(hidden_dim//2, hidden_dim//4, kernel_size=4, stride=2, padding=1),
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=False),
+            nn.Conv1d(hidden_dim//2, hidden_dim//4, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             # 128 → 256
-            nn.ConvTranspose1d(hidden_dim//4, hidden_dim//8, kernel_size=4, stride=2, padding=1),
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=False),
+            nn.Conv1d(hidden_dim//4, hidden_dim//8, kernel_size=3, padding=1),
         )
         
         # Separate classification heads for x and y

@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from .model_cnn_cnn import CNNCNNVAE, LightweightCNNCNNVAE
+from .model_cnn_seededcnn import CNNSeededCNNVAE
 from .data_loader import StreamingGestureDataLoader
 from .loss_functions import VAELoss, BetaVAELoss, KLAnnealingVAELoss, create_loss_function
 from .utils import (CoordinateQuantizer, CheckpointManager, ExperimentLogger, Visualizer,
@@ -32,12 +32,6 @@ def train_epoch(model, train_loader, optimizer, loss_fn, quantizer, device,
     total_recon_y_loss = 0
     total_kl_loss = 0
     num_batches = 0
-    
-    # Hard limit: 30 visualizations per epoch maximum
-    MAX_VISUALIZATIONS_PER_EPOCH = 30
-    total_steps_per_epoch = len(train_loader)
-    vis_interval_steps = max(1, total_steps_per_epoch // MAX_VISUALIZATIONS_PER_EPOCH)
-    epoch_vis_count = 0
     
     pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
     
@@ -117,14 +111,6 @@ def train_epoch(model, train_loader, optimizer, loss_fn, quantizer, device,
             step_counter[0] > 0  # Skip step 0
         )
         
-        # Check if visualization should be performed (fixed interval, independent of validation)
-        current_step_in_epoch = batch_idx
-        should_create_vis = (
-            epoch_vis_count < MAX_VISUALIZATIONS_PER_EPOCH and
-            current_step_in_epoch % vis_interval_steps == 0 and
-            current_step_in_epoch > 0  # Skip step 0
-        )
-        
         if should_validate:
             val_metrics = validate_epoch(
                 model=model,
@@ -136,7 +122,7 @@ def train_epoch(model, train_loader, optimizer, loss_fn, quantizer, device,
                 visualizer=visualizer,
                 epoch=epoch,
                 step_counter=step_counter,
-                create_visualizations=False,  # No vis during regular validation
+                create_visualizations=vis_with_val,
                 monitor=monitor
             )
             
@@ -150,38 +136,13 @@ def train_epoch(model, train_loader, optimizer, loss_fn, quantizer, device,
             # Return to training mode after validation
             model.train()
         
-        if should_create_vis and val_loader is not None:
-            # Run validation just for visualization purposes
-            val_metrics = validate_epoch(
-                model=model,
-                val_loader=val_loader,
-                loss_fn=loss_fn,
-                quantizer=quantizer,
-                device=device,
-                logger=logger,
-                visualizer=visualizer,
-                epoch=epoch,
-                step_counter=step_counter,
-                create_visualizations=True,
-                monitor=monitor
-            )
-            epoch_vis_count += 1
-            
-            # Log visualization info
-            pbar.write(f"Step {step_counter[0]} Visualization #{epoch_vis_count} - "
-                      f"Loss: {val_metrics['total_loss']:.4f}")
-            
-            # Return to training mode after validation
-            model.train()
-        
         # Update progress bar
         pbar.set_postfix({
             'Loss': f'{loss.item():.4f}',
             'Recon': f'{loss_dict["recon_loss"].item():.4f}',
             'KL': f'{loss_dict["kl_loss"].item():.4f}',
             'Beta': f'{loss_dict.get("beta", 1.0):.3f}',
-            'Step': step_counter[0],
-            'Vis': f'{epoch_vis_count}/{MAX_VISUALIZATIONS_PER_EPOCH}'
+            'Step': step_counter[0]
         })
     
     return {
@@ -189,8 +150,7 @@ def train_epoch(model, train_loader, optimizer, loss_fn, quantizer, device,
         'recon_loss': total_recon_loss / num_batches,
         'recon_x_loss': total_recon_x_loss / num_batches,
         'recon_y_loss': total_recon_y_loss / num_batches,
-        'kl_loss': total_kl_loss / num_batches,
-        'epoch_vis_count': epoch_vis_count  # Return visualization count
+        'kl_loss': total_kl_loss / num_batches
     }
 
 
@@ -365,7 +325,7 @@ def validate_epoch(model, val_loader, loss_fn, quantizer, device, logger,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train CNN-CNN VAE')
+    parser = argparse.ArgumentParser(description='Train CNN-SeededCNN VAE')
     
     # Data arguments
     parser.add_argument('--data_path', type=str, required=True,
@@ -378,24 +338,16 @@ def main():
                        help='Skip validation entirely (faster training, no validation metrics)')
     
     # Model arguments
-    parser.add_argument('--d_latent', type=int, default=128,
+    parser.add_argument('--d_latent', type=int, default=124,
                        help='Latent dimension')
-    parser.add_argument('--k_classes', type=int, default=3000,
+    parser.add_argument('--k_classes', type=int, default=5000,
                        help='Number of quantization classes')
-    parser.add_argument('--hidden_dim', type=int, default=256,
-                       help='Hidden dimension for both encoder and decoder')
-    parser.add_argument('--lightweight', action='store_true',
-                       help='Use lightweight model variant')
-    
-    # Decoder configuration arguments
-    parser.add_argument('--decoder_channels', type=int, nargs='*', default=None,
-                       help='Custom decoder channel progression (e.g. --decoder_channels 512 384 256 128)')
-    parser.add_argument('--conv_kernel', type=int, default=4,
-                       help='Kernel size for ConvTranspose1d layers (default: 4, prevents checkerboard artifacts)')
-    parser.add_argument('--conv_stride', type=int, default=2,
-                       help='Stride for ConvTranspose1d layers (default: 2)')
-    parser.add_argument('--use_output_padding', action='store_true',
-                       help='Use output_padding in ConvTranspose1d layers (default: False)')
+    parser.add_argument('--encoder_hidden_dim', type=int, default=256,
+                       help='Hidden dimension for encoder')
+    parser.add_argument('--decoder_feature_dim', type=int, default=256,
+                       help='Feature dimension for SeededCNN decoder')
+    parser.add_argument('--decoder_num_layers', type=int, default=8,
+                       help='Number of dilated conv layers in SeededCNN decoder')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=32,
@@ -466,7 +418,7 @@ def main():
     # Generate experiment name with encoder/decoder info
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     encoder_name = "cnn"  # Current implementation uses CNN encoder
-    decoder_name = "cnn"  # Current implementation uses CNN decoder
+    decoder_name = "seededcnn"  # Current implementation uses SeededCNN decoder
     
     # Generate unique experiment name
     experiment_name = args.experiment_name or generate_experiment_name(
@@ -508,8 +460,7 @@ def main():
         checkpoint_dir=str(checkpoint_dir),
         max_checkpoints=5,
         save_source=True,
-        num_elite=args.num_elite,
-        training_args=args
+        num_elite=args.num_elite
     )
     
     print(f"Elite model saving enabled: keeping top {args.num_elite} models")
@@ -648,23 +599,13 @@ def main():
     
     # Create model
     print("Creating model...")
-    if args.lightweight:
-        model = LightweightCNNCNNVAE(
-            d_latent=args.d_latent,
-            k_classes=args.k_classes,
-            hidden_dim=args.hidden_dim
-        )
-    else:
-        model = CNNCNNVAE(
-            d_latent=args.d_latent,
-            k_classes=args.k_classes,
-            encoder_hidden_dim=args.hidden_dim,
-            decoder_hidden_dim=args.hidden_dim,
-            decoder_channels=args.decoder_channels,
-            conv_kernel=args.conv_kernel,
-            conv_stride=args.conv_stride,
-            use_output_padding=args.use_output_padding
-        )
+    model = CNNSeededCNNVAE(
+        d_latent=args.d_latent,
+        k_classes=args.k_classes,
+        encoder_hidden_dim=args.encoder_hidden_dim,
+        decoder_feature_dim=args.decoder_feature_dim,
+        decoder_num_layers=args.decoder_num_layers
+    )
     
     model = model.to(device)
     num_params = sum(p.numel() for p in model.parameters())
@@ -676,11 +617,6 @@ def main():
     
     # Log model architecture to wandb
     logger.log_model_architecture(model, model_summary_text=model_summary)
-    
-    # Enable wandb model watching for automatic gradient tracking
-    if logger.enabled:
-        import wandb
-        wandb.watch(model, log="gradients", log_freq=100)
     
     # Create loss function
     if args.kl_anneal is not None:
@@ -781,11 +717,10 @@ def main():
     
     print("Starting training...")
     print(f"Logging enabled: {logger.enabled}")
-    print("⚠️  Visualization limit: Maximum 30 visualizations per epoch (hard-coded limit)")
     if args.vis_with_val and val_loader:
-        print(f"Visualizations will be created with validation (up to limit)")
+        print(f"Visualizations will be created with each validation")
     elif args.vis_interval:
-        print(f"Visualization interval: every {args.vis_interval} steps (up to limit)")
+        print(f"Visualization interval: every {args.vis_interval} steps")
     else:
         print("Visualizations disabled")
     
@@ -806,8 +741,7 @@ def main():
             val_loader=val_loader,
             val_steps=val_steps,
             log_interval=args.log_interval,
-            vis_with_val=args.vis_with_val,
-            monitor=monitor
+            vis_with_val=args.vis_with_val
         )
         
         # Log epoch-level training metrics
@@ -838,15 +772,8 @@ def main():
             )
             
             if run_epoch_val:
-                # Check if we've already hit the visualization limit for this epoch
-                epoch_vis_count = train_metrics.get('epoch_vis_count', 0)
-                MAX_VISUALIZATIONS_PER_EPOCH = 30
-                
-                # Create visualizations for end-of-epoch validation only if under limit
-                create_vis = (
-                    ((epoch % max(1, args.epochs // 10) == 0) or epoch == args.epochs) and
-                    epoch_vis_count < MAX_VISUALIZATIONS_PER_EPOCH
-                )
+                # Create visualizations for end-of-epoch validation
+                create_vis = (epoch % max(1, args.epochs // 10) == 0) or epoch == args.epochs
                 
                 val_metrics = validate_epoch(
                     model=model,
@@ -954,7 +881,7 @@ def main():
         print(f"  • Final step: {step_counter[0]}")
     
     print(f"\n💾 To resume training from this point, use:")
-    print(f"  python -m conditioned_gesture_generator.gesture_vae.train_cnn_cnn \\")
+    print(f"  python -m conditioned_gesture_generator.gesture_vae.train_cnn_seededcnn \\")
     print(f"    --resume {checkpoint_dir}/best_model.pt \\")
     print(f"    --epochs {args.epochs + 50} \\")
     print(f"    [your other arguments]")
@@ -964,13 +891,13 @@ def main():
         print(f"\n🏆 To resume from best elite model:")
         best_elite = checkpoint_manager.get_best_elite_model()
         if best_elite:
-            print(f"  python -m conditioned_gesture_generator.gesture_vae.train_cnn_cnn \\")
+            print(f"  python -m conditioned_gesture_generator.gesture_vae.train_cnn_seededcnn \\")
             print(f"    --resume {best_elite} \\")
             print(f"    --epochs {args.epochs + 50} \\")
             print(f"    [your other arguments]")
     
     print(f"\n🔍 To list available checkpoints and elite models:")
-    print(f"  python -m conditioned_gesture_generator.gesture_vae.train_cnn_cnn \\")
+    print(f"  python -m conditioned_gesture_generator.gesture_vae.train_cnn_seededcnn \\")
     print(f"    --list_checkpoints \\")
     print(f"    --checkpoint_base_dir {args.checkpoint_base_dir} \\")
     print(f"    --experiment_name {experiment_name}")
