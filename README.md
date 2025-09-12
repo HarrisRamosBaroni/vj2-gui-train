@@ -47,4 +47,4 @@ You may increase batch size depending on the GPU constrants. Adjust `num_workers
 
 ### Latent action model training
 
-`python -m latent_action_model.training --data_dir ./mother --manifest_path ./mother/manifests/experiment_A.json --num_epochs 60 --batch_size 48 --min_context 2 --max_context 5 --encoder_depth 12 --decoder_depth 12 --encoder_heads 16 --decoder_heads 16 --embed_dim 512 --context_schedule linear --learning_rate 1e-4 --kl_weight 0.0005 --num_workers 6`
+`python -m latent_action_model.training --data_dir ./mother --manifest_path ./mother/manifests/experiment_A.json --num_epochs 60 --batch_size 48 --min_context 2 --max_context 5 --encoder_depth 16 --decoder_depth 16 --encoder_heads 16 --decoder_heads 16 --embed_dim 512 --context_schedule linear --learning_rate 1e-4 --kl_weight 0.0005 --num_workers 6`
