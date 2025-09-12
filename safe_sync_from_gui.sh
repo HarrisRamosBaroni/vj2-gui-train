@@ -19,6 +19,7 @@ FILES_TO_SYNC=(
     "gui_world_model/predictor_prob.py"
     "gui_world_model/predictor_prob_film.py"
     "conditioned_gesture_generator/"
+    "latent_action_model/"
     # "training/test/"
     "training/validators/"
     "training/__init__.py"
