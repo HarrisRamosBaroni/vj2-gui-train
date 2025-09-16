@@ -497,9 +497,20 @@ class LAMTrainer:
         d_rand = torch.norm(z_pred_rand_flat - z_target_flat, dim=1)  # [B]
         d_action_eps = torch.norm(z_pred_perturbed_flat - z_target_flat, dim=1)  # [B]
         
+        # L1 distances
+        d_action_l1 = torch.norm(z_pred_true_flat - z_target_flat, p=1, dim=1)  # [B]
+        d_rand_l1 = torch.norm(z_pred_rand_flat - z_target_flat, p=1, dim=1)  # [B]
+        
+        # MAE (Mean Absolute Error) - averaged over all dimensions
+        num_elements = z_pred_true_flat.shape[1]  # N*D
+        d_action_mae = torch.abs(z_pred_true_flat - z_target_flat).sum(dim=1) / num_elements  # [B]
+        d_rand_mae = torch.abs(z_pred_rand_flat - z_target_flat).sum(dim=1) / num_elements  # [B]
+        
         # Action sensitivity: Δd = d_rand - d_action
         # Positive values indicate decoder uses action meaningfully
         action_sensitivity = (d_rand - d_action).mean().item()
+        action_sensitivity_l1 = (d_rand_l1 - d_action_l1).mean().item()
+        action_sensitivity_mae = (d_rand_mae - d_action_mae).mean().item()
         
         # DSNR: Decoder Signal-to-Noise Ratio
         # DSNR = (d_rand - d_action) / (d_action_eps - d_action)
@@ -523,11 +534,17 @@ class LAMTrainer:
             'mse_loss': loss_dict['mse_loss'].item(),
             'kl_loss': loss_dict['kl_loss'].item(),
             'action_sensitivity_l2': action_sensitivity,
+            'action_sensitivity_l1': action_sensitivity_l1,
+            'action_sensitivity_mae': action_sensitivity_mae,
             'action_sensitivity_cos': action_sensitivity_cos,
             'dsnr': dsnr_mean,
             'd_action_l2': d_action.mean().item(),
             'd_rand_l2': d_rand.mean().item(),
             'd_action_eps_l2': d_action_eps.mean().item(),
+            'd_action_l1': d_action_l1.mean().item(),
+            'd_rand_l1': d_rand_l1.mean().item(),
+            'd_action_mae': d_action_mae.mean().item(),
+            'd_rand_mae': d_rand_mae.mean().item(),
             'total_tflops': self.total_tflops  # Include cumulative TFLOPs
         }
     
