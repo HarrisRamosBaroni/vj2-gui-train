@@ -149,7 +149,12 @@ class LAMTrainer:
         wandb_run_name: Optional[str] = None,
         test_mode: bool = False,
         use_scheduler: bool = False,
-        min_lr_ratio: float = 0.1
+        min_lr_ratio: float = 0.1,
+        rollout_horizon: int = 2,
+        rollout_weight: float = 1.0,
+        rollout_prob: float = 1.0,
+        detach_rollout_first: bool = True,
+        anchor_strategy: str = "random"
     ):
         """
         Args:
@@ -170,6 +175,11 @@ class LAMTrainer:
             mixed_precision: Use mixed precision training
             use_scheduler: Enable manual LR scheduling with warmup and cosine annealing
             min_lr_ratio: Minimum LR as ratio of base LR (e.g., 0.1 = 10% of base)
+            rollout_horizon: Number of steps for rollout (1 = no rollout; 2-3 typical)
+            rollout_weight: Weight for rollout loss component
+            rollout_prob: Probability of computing rollout loss (0-1)
+            detach_rollout_first: Whether to detach first predicted state before rollout
+            anchor_strategy: Rollout anchor strategy ("random" or "last")
         """
         self.model = model.to(device)
         self.device = device
@@ -194,6 +204,13 @@ class LAMTrainer:
         self.kl_annealing_steps = kl_annealing_steps
         self.kl_min_weight = kl_min_weight
         self.kl_max_weight = model.kl_weight
+
+        # Rollout parameters
+        self.rollout_horizon = rollout_horizon
+        self.rollout_weight = rollout_weight
+        self.rollout_prob = rollout_prob
+        self.detach_rollout_first = detach_rollout_first
+        self.anchor_strategy = anchor_strategy
         
         # Checkpointing
         # Create timestamped checkpoint directory
@@ -250,7 +267,12 @@ class LAMTrainer:
                     'warmup_steps': warmup_steps,
                     'kl_annealing_steps': kl_annealing_steps,
                     'mixed_precision': mixed_precision,
-                    'test_mode': test_mode
+                    'test_mode': test_mode,
+                    'rollout_horizon': rollout_horizon,
+                    'rollout_weight': rollout_weight,
+                    'rollout_prob': rollout_prob,
+                    'detach_rollout_first': detach_rollout_first,
+                    'anchor_strategy': anchor_strategy
                 }
             )
             wandb.watch(model, log='gradients', log_freq=500)  # Reduce overhead
@@ -394,10 +416,26 @@ class LAMTrainer:
         # Forward pass with mixed precision
         if self.mixed_precision:
             with torch.cuda.amp.autocast():
-                loss_dict = self.model.compute_loss(batch, beta_schedule=kl_weight)
+                loss_dict = self.model.compute_loss(
+                    batch,
+                    beta_schedule=kl_weight,
+                    rollout_horizon=self.rollout_horizon,
+                    rollout_weight=self.rollout_weight,
+                    rollout_prob=self.rollout_prob,
+                    detach_rollout_first=self.detach_rollout_first,
+                    anchor_strategy=self.anchor_strategy
+                )
                 loss = loss_dict['loss']
         else:
-            loss_dict = self.model.compute_loss(batch, beta_schedule=kl_weight)
+            loss_dict = self.model.compute_loss(
+                batch,
+                beta_schedule=kl_weight,
+                rollout_horizon=self.rollout_horizon,
+                rollout_weight=self.rollout_weight,
+                rollout_prob=self.rollout_prob,
+                detach_rollout_first=self.detach_rollout_first,
+                anchor_strategy=self.anchor_strategy
+            )
             loss = loss_dict['loss']
         
         # Backward pass
@@ -427,14 +465,21 @@ class LAMTrainer:
             self.total_tflops += self.tflops_per_step
         
         # Return metrics
-        return {
+        metrics = {
             'loss': loss.item(),
             'recon_loss': loss_dict['recon_loss'].item(),
             'kl_loss': loss_dict['kl_loss'].item(),
+            'rollout_loss': loss_dict['rollout_loss'].item(),
             'kl_weight': kl_weight,
             'lr': self.get_lr(),
             'total_tflops': self.total_tflops  # Include cumulative TFLOPs
         }
+
+        # Add MSE loss if available
+        if 'mse_loss' in loss_dict:
+            metrics['mse_loss'] = loss_dict['mse_loss'].item()
+
+        return metrics
     
     @torch.no_grad()
     def eval_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
@@ -453,8 +498,15 @@ class LAMTrainer:
         # Note: Additional layer normalization is also applied inside the model after patch_proj
         # for stability (on embed_dim=512). This double normalization is intentional.
         
-        # Forward pass for standard losses
-        loss_dict = self.model.compute_loss(batch)
+        # Forward pass for standard losses with rollout parameters
+        loss_dict = self.model.compute_loss(
+            batch,
+            rollout_horizon=self.rollout_horizon,
+            rollout_weight=self.rollout_weight,
+            rollout_prob=self.rollout_prob,
+            detach_rollout_first=self.detach_rollout_first,
+            anchor_strategy=self.anchor_strategy
+        )
         
         # Action sensitivity check
         z_sequence = batch['sequence']  # [B, T, N, D]
@@ -533,6 +585,7 @@ class LAMTrainer:
             'recon_loss': loss_dict['recon_loss'].item(),
             'mse_loss': loss_dict['mse_loss'].item(),
             'kl_loss': loss_dict['kl_loss'].item(),
+            'rollout_loss': loss_dict['rollout_loss'].item(),
             'action_sensitivity_l2': action_sensitivity,
             'action_sensitivity_l1': action_sensitivity_l1,
             'action_sensitivity_mae': action_sensitivity_mae,
@@ -576,6 +629,7 @@ class LAMTrainer:
                         'loss': f"{metrics['loss']:.4f}",
                         'recon': f"{metrics['recon_loss']:.4f}",
                         'kl': f"{metrics['kl_loss']:.4f}",
+                        'rollout': f"{metrics['rollout_loss']:.4f}",
                         'kl_w': f"{metrics['kl_weight']:.3f}"
                     }
                     progress_bar.set_postfix(postfix)
@@ -610,6 +664,7 @@ class LAMTrainer:
                         'loss': f"{metrics['loss']:.4f}",
                         'recon': f"{metrics['recon_loss']:.4f}",
                         'kl': f"{metrics['kl_loss']:.4f}",
+                        'rollout': f"{metrics['rollout_loss']:.4f}",
                         'kl_w': f"{metrics['kl_weight']:.3f}"
                     }
                     if 'mse_loss' in metrics:
@@ -626,6 +681,7 @@ class LAMTrainer:
                             'tflops/train_loss': metrics['loss'],
                             'tflops/train_recon_loss': metrics['recon_loss'],
                             'tflops/train_kl_loss': metrics['kl_loss'],
+                            'tflops/train_rollout_loss': metrics['rollout_loss'],
                             'tflops/x_axis': metrics['total_tflops']
                         }, step=self.global_step)
                 
@@ -668,7 +724,8 @@ class LAMTrainer:
                 postfix = {
                     'loss': f"{metrics['loss']:.4f}",
                     'recon': f"{metrics['recon_loss']:.4f}",
-                    'kl': f"{metrics['kl_loss']:.4f}"
+                    'kl': f"{metrics['kl_loss']:.4f}",
+                    'rollout': f"{metrics['rollout_loss']:.4f}"
                 }
                 if 'mse_loss' in metrics:
                     postfix['mse'] = f"{metrics['mse_loss']:.4f}"
@@ -697,10 +754,12 @@ class LAMTrainer:
                 # These will create plots with TFLOPs on x-axis when viewed in WandB
                 if total_tflops > 0:
                     # Primary metrics vs TFLOPs
+                    rollout_loss = epoch_metrics.get('rollout_loss', 0.0)
                     wandb.log({
                         'tflops/val_loss': val_loss,
                         'tflops/val_recon_loss': recon_loss,
                         'tflops/val_kl_loss': kl_loss,
+                        'tflops/val_rollout_loss': rollout_loss,
                         'tflops/val_dsnr': dsnr,
                         'tflops/x_axis': total_tflops  # This serves as the x-axis value
                     }, step=self.global_step)
@@ -991,7 +1050,12 @@ def train_with_variable_context(
         mixed_precision=kwargs.get('mixed_precision', True),
         test_mode=kwargs.get('test_mode', False),
         use_scheduler=kwargs.get('use_scheduler', False),
-        min_lr_ratio=kwargs.get('min_lr_ratio', 0.1)
+        min_lr_ratio=kwargs.get('min_lr_ratio', 0.1),
+        rollout_horizon=kwargs.get('rollout_horizon', 2),
+        rollout_weight=kwargs.get('rollout_weight', 1.0),
+        rollout_prob=kwargs.get('rollout_prob', 1.0),
+        detach_rollout_first=kwargs.get('detach_rollout_first', True),
+        anchor_strategy=kwargs.get('anchor_strategy', 'random')
     )
     
     # Initial validation run to establish baseline (skip in test mode)
@@ -1089,7 +1153,14 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8, help="Number of dataloader workers")
     parser.add_argument("--scheduler", action="store_true", help="Enable manual LR scheduling with warmup and cosine annealing")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Minimum LR as ratio of base LR (default: 0.1 = 10%% of base)")
-    
+
+    # Rollout loss arguments
+    parser.add_argument("--rollout_horizon", type=int, default=2, help="Number of steps for rollout (1 = no rollout; 2-3 typical)")
+    parser.add_argument("--rollout_weight", type=float, default=1.0, help="Weight for rollout loss component")
+    parser.add_argument("--rollout_prob", type=float, default=1.0, help="Probability of computing rollout loss (0-1)")
+    parser.add_argument("--detach_rollout_first", action="store_true", help="Detach first predicted state before rollout for gradient stability")
+    parser.add_argument("--anchor_strategy", type=str, default="random", choices=["random", "last"], help="Rollout anchor strategy")
+
     # Model architecture arguments
     parser.add_argument("--latent_dim", type=int, default=1024, help="Patch token dimension (default: 1024)")
     parser.add_argument("--encoder_depth", type=int, default=3, help="Number of encoder transformer layers")
@@ -1135,6 +1206,12 @@ if __name__ == "__main__":
         test_mode=args.test_mode,
         use_scheduler=args.scheduler,
         min_lr_ratio=args.min_lr_ratio,
+        # Rollout loss parameters
+        rollout_horizon=args.rollout_horizon,
+        rollout_weight=args.rollout_weight,
+        rollout_prob=args.rollout_prob,
+        detach_rollout_first=args.detach_rollout_first,
+        anchor_strategy=args.anchor_strategy,
         # Model architecture parameters
         latent_dim=args.latent_dim,
         encoder_depth=args.encoder_depth,

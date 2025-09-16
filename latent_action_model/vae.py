@@ -316,42 +316,92 @@ class LatentActionVAE(nn.Module):
     def compute_loss(
         self,
         batch: Dict[str, torch.Tensor],
-        beta_schedule: Optional[float] = None
+        beta_schedule: float = 1.0,
+        rollout_horizon: int = 2,          # 1 ⇒ no rollout; 2–3 is typical
+        rollout_weight: float = 1.0,       # scale for rollout loss
+        rollout_prob: float = 1.0,         # compute rollout with this probability
+        detach_rollout_first: bool = True, # detach first predicted state before rolling
+        anchor_strategy: str = "random"      # "last" or "random"
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute VAE loss for a batch of data.
-        
-        Args:
-            batch: Dictionary containing 'sequence', 'past', and 'next' tensors
-            beta_schedule: Optional beta value for KL weight annealing
-        
-        Returns:
-            Dictionary with loss values
+        Decoder-only rollout:
+          - Encoder ALWAYS sees GT z-seq once to produce a_seq (no iterative encoding).
+          - Decoder rolls forward from its OWN prediction, but actions stay GT.
+          - Adds only (rollout_horizon - 1) extra decode calls per batch (anchor shared).
         """
-        z_sequence = batch['sequence']  # [B, T, N, D] patch format
-        z_target = batch['next']  # [B, N, D] patch format
-        
-        # Forward pass
-        output = self.forward(z_sequence, return_components=True)
-        
-        # Apply beta schedule if provided
-        if beta_schedule is not None:
-            kl_weight = beta_schedule
-        else:
-            kl_weight = self.kl_weight
-        
-        # Recompute total loss with scheduled beta
-        total_loss = (
-            self.reconstruction_weight * output['recon_loss'] + 
-            kl_weight * output['kl_loss']
-        )
-        
+        z_sequence = batch["sequence"]  # [B,T,N,D], already layer-normed by trainer
+        B, T, N, D = z_sequence.shape
+        assert T >= 2, "Need at least two frames"
+
+        # ----- 1) Encode actions ONCE from GT sequence (NO rollout on encoder) -----
+        mu, logvar = self.encode(z_sequence)             # [B, T-1, A]
+        logvar = logvar.clamp(-5, 5)
+        a_seq = self.reparameterize(mu, logvar)          # [B, T-1, A]
+
+        # ----- 2) Teacher-forced next-frame predictions for ALL steps -----
+        # Reuse your existing per-step decode loop (keeps behavior identical).
+        recons = []
+        for t in range(T - 1):
+            z_past = z_sequence[:, :t+1]                 # [B, t+1, N, D]
+            a_t = a_seq[:, t]                            # [B, A]
+            z_next_pred = self.decode(z_past, a_t)       # [B, N, D]
+            recons.append(z_next_pred)
+        recons = torch.stack(recons, dim=1)              # [B, T-1, N, D]
+
+        # Reconstruction & MSE (teacher-forced) over ALL steps
+        targets = z_sequence[:, 1:]                      # [B, T-1, N, D]
+        recon = torch.abs(recons - targets).mean(dim=-1) # per-patch MAE
+        recon_loss = recon.mean()
+        mse = (recons - targets).pow(2).mean(dim=-1)
+        mse_loss = mse.mean()
+
+        # KL over transitions (use scheduler-provided weight)
+        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1)  # [B, T-1]
+        kl_loss = kl.mean()
+
+        # Base loss (no rollout yet)
+        total_loss = self.reconstruction_weight * recon_loss + beta_schedule * kl_loss
+
+        # ----- 3) Optional decoder-only rollout starting from ONE anchor -----
+        rollout_loss = torch.zeros((), device=z_sequence.device)
+        if rollout_horizon > 1 and torch.rand(()) < rollout_prob:
+            # Valid anchors: t in [0, T-1-rollout_horizon]
+            max_start = (T - 1) - rollout_horizon
+            if max_start >= 0:
+                if anchor_strategy == "random":
+                    t0 = int(torch.randint(low=0, high=max_start + 1, size=(1,)).item())
+                else:
+                    t0 = max_start  # "last": start as far right as possible
+
+                # Step 1 (already computed via teacher forcing):
+                # prediction for z_{t0+1} is recons[:, t0]
+                z_cur = recons[:, t0]                     # [B, N, D]
+                if detach_rollout_first:
+                    z_cur = z_cur.detach()               # stabilize gradients
+
+                # Roll forward K-1 steps using GT actions but predicted states
+                # Extra decodes: (rollout_horizon - 1)
+                z_hist = z_sequence[:, :t0+1]             # [B, t0+1, N, D]
+                acc = 0.0
+                count = 0
+                for k in range(1, rollout_horizon):
+                    # History grows by 1 predicted state each step
+                    z_hist = torch.cat([z_hist, z_cur.unsqueeze(1)], dim=1)  # [B, t0+1+k, N, D]
+                    a_k = a_seq[:, t0 + k]                                   # GT action for this step
+                    z_cur = self.decode(z_hist, a_k)                         # predict next state
+                    z_true = z_sequence[:, t0 + 1 + k]                       # GT state
+                    acc += torch.abs(z_cur - z_true).mean()                  # MAE
+                    count += 1
+                rollout_loss = acc / max(1, count)
+
+                total_loss = total_loss + rollout_weight * rollout_loss
+
         return {
-            'loss': total_loss,
-            'recon_loss': output['recon_loss'],
-            'mse_loss': output['mse_loss'],
-            'kl_loss': output['kl_loss'],
-            'kl_weight': kl_weight
+            "loss": total_loss,
+            "recon_loss": recon_loss,
+            "mse_loss": mse_loss,
+            "kl_loss": kl_loss,
+            "rollout_loss": rollout_loss,
         }
 
 
@@ -430,34 +480,6 @@ if __name__ == "__main__":
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
-
-
-def load_lam_config(path: str) -> dict:
-    import yaml
-    # Load YAML
-    with open(path, "r") as f:
-        data = yaml.safe_load(f)
-
-    # Get the dynamic run info (the first entry under "_wandb -> value -> e")
-    e_dict = data["_wandb"]["value"]["e"]
-    run_info = next(iter(e_dict.values()))  # works even if key is random
-
-    # Parse args into a dict
-    args = run_info["args"]
-    arg_dict = {args[i].lstrip("-"): args[i+1] for i in range(0, len(args), 2)}
-
-    # Build lam_config
-    lam_config = {
-        "latent_dim": data["latent_dim"]["value"],
-        "action_dim": data["action_dim"]["value"],
-        "embed_dim": int(arg_dict["embed_dim"]),
-        "encoder_depth": int(arg_dict["encoder_depth"]),
-        "decoder_depth": int(arg_dict["decoder_depth"]),
-        "encoder_heads": int(arg_dict["encoder_heads"]),
-        "decoder_heads": int(arg_dict["decoder_heads"]),
-        "kl_weight": float(arg_dict["kl_weight"]),
-    }
-    return lam_config
 
 def load_model_from_config(config_path: str, checkpoint_path: str, device: str = "cuda") -> LatentActionVAE:
     """
