@@ -192,7 +192,8 @@ def create_dataloaders(
     stride_val: int = 4,
     num_workers: int = 8,
     pin_memory: bool = True,
-    return_samplers: bool = False
+    return_samplers: bool = False,
+    ddp: bool = False
 ):
     """
     Create train, validation, and test dataloaders.
@@ -209,6 +210,7 @@ def create_dataloaders(
         num_workers: Number of dataloader workers
         pin_memory: Whether to pin memory for GPU transfer
         return_samplers: If True, also return the samplers for DDP epoch setting
+        ddp: Whether to use DistributedDataParallel
     
     Returns:
         If return_samplers is False:
@@ -217,8 +219,8 @@ def create_dataloaders(
             Tuple of ((train_loader, val_loader, test_loader), (train_sampler, val_sampler, test_sampler))
         val_loader and test_loader may be None if splits don't exist
     """
-    # Check if DDP is initialized
-    use_ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+    # Use the passed ddp flag
+    use_ddp = ddp
     
     # Create train dataset
     train_dataset = LAMDataset(

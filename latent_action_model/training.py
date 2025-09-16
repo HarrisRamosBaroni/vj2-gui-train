@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 # Removed TensorBoard - using only WandB
 import numpy as np
@@ -35,6 +37,16 @@ from .dataloader import create_dataloaders, LAMDataset
 
 
 logger = logging.getLogger(__name__)
+
+
+def _ddp_mean(x: float, device) -> float:
+    """Average a scalar across all DDP ranks."""
+    if not dist.is_initialized():
+        return x
+    t = torch.tensor([x], dtype=torch.float32, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    t /= dist.get_world_size()
+    return float(t.item())
 
 
 def calculate_model_flops(model, input_shape=(8, 256, 1024), device="cuda"):
@@ -181,15 +193,22 @@ class LAMTrainer:
             detach_rollout_first: Whether to detach first predicted state before rollout
             anchor_strategy: Rollout anchor strategy ("random" or "last")
         """
-        self.model = model.to(device)
         self.device = device
+        self.use_ddp = dist.is_initialized()
+        
+        if self.use_ddp:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            self.model = DDP(model.to(device), device_ids=[local_rank])
+        else:
+            self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
         
         # Optimizer and scheduler
+        model_for_optim = self.model.module if self.use_ddp else self.model
         self.optimizer = optim.AdamW(
-            model.parameters(),
+            model_for_optim.parameters(),
             lr=learning_rate,
             betas=(0.9, 0.999),
             weight_decay=0.01
@@ -203,7 +222,7 @@ class LAMTrainer:
         self.max_grad_norm = max_grad_norm
         self.kl_annealing_steps = kl_annealing_steps
         self.kl_min_weight = kl_min_weight
-        self.kl_max_weight = model.kl_weight
+        self.kl_max_weight = model_for_optim.kl_weight
 
         # Rollout parameters
         self.rollout_horizon = rollout_horizon
@@ -219,7 +238,7 @@ class LAMTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Save model config immediately
-        self._save_model_config(model)
+        self._save_model_config(model_for_optim)
         self.save_every = save_every
         self.eval_every = eval_every
         
@@ -254,14 +273,14 @@ class LAMTrainer:
         self.fixed_batch = None  # Will store the single batch in test mode
         
         self.use_wandb = use_wandb
-        if use_wandb:
+        if use_wandb and (not self.use_ddp or dist.get_rank() == 0):
             run_name = wandb_run_name or (f"lam_test_mode_{datetime.now().strftime('%Y%m%d_%H%M%S')}" if test_mode else None)
             wandb.init(
                 project=wandb_project,
                 name=run_name,
                 config={
-                    'latent_dim': model.latent_dim,
-                    'action_dim': model.action_dim,
+                    'latent_dim': model_for_optim.latent_dim,
+                    'action_dim': model_for_optim.action_dim,
                     'learning_rate': learning_rate,
                     'batch_size': train_loader.batch_size,
                     'warmup_steps': warmup_steps,
@@ -275,7 +294,7 @@ class LAMTrainer:
                     'anchor_strategy': anchor_strategy
                 }
             )
-            wandb.watch(model, log='gradients', log_freq=500)  # Reduce overhead
+            wandb.watch(model_for_optim, log='gradients', log_freq=500)
         
         # In test mode, grab and store a single batch
         if self.test_mode:
@@ -291,7 +310,7 @@ class LAMTrainer:
             self.kl_weight = 0.0
             self.kl_min_weight = 0.0
             self.kl_max_weight = 0.0
-            self.model.kl_weight = 0.0
+            model_for_optim.kl_weight = 0.0
             
             # Disable dropout in the model
             self._disable_dropout()
@@ -671,8 +690,8 @@ class LAMTrainer:
                         postfix['mse'] = f"{metrics['mse_loss']:.4f}"
                     progress_bar.set_postfix(postfix)
                 
-                # Log to wandb
-                if self.global_step % 20 == 0 and self.use_wandb:
+                # Log to wandb (rank 0 only)
+                if self.global_step % 20 == 0 and self.use_wandb and (not self.use_ddp or dist.get_rank() == 0):
                     wandb.log({f'train/{k}': v for k, v in metrics.items()}, step=self.global_step)
                     
                     # Also log training loss vs TFLOPs for plotting
@@ -737,9 +756,14 @@ class LAMTrainer:
         num_batches = len(loader)
         for key in epoch_metrics:
             epoch_metrics[key] /= num_batches
+            
+        # Average across DDP ranks
+        if self.use_ddp:
+            for key in epoch_metrics:
+                epoch_metrics[key] = _ddp_mean(epoch_metrics[key], self.device)
         
-        # Log to wandb with TFLOP tracking for plots
-        if self.use_wandb:
+        # Log to wandb with TFLOP tracking for plots (rank 0 only)
+        if self.use_wandb and (not self.use_ddp or dist.get_rank() == 0):
             log_dict = {f'{split}/{k}': v for k, v in epoch_metrics.items()}
             
             # Add TFLOP-indexed metrics for validation to create plots with TFLOPs on x-axis
@@ -792,16 +816,20 @@ class LAMTrainer:
     
     def save_checkpoint(self, is_best: bool = False, checkpoint_type: str = 'regular'):
         """Save model checkpoint."""
+        if self.use_ddp and dist.get_rank() != 0:
+            return
+            
+        model_for_save = self.model.module if self.use_ddp else self.model
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_for_save.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': {
-                'latent_dim': self.model.latent_dim,
-                'action_dim': self.model.action_dim,
-                'kl_weight': self.model.kl_weight
+                'latent_dim': model_for_save.latent_dim,
+                'action_dim': model_for_save.action_dim,
+                'kl_weight': model_for_save.kl_weight
             }
         }
         
@@ -974,6 +1002,7 @@ def train_with_variable_context(
     max_context_length: int = 20,
     context_schedule: str = "linear",
     device: str = "cuda",
+    is_ddp: bool = False,
     **kwargs
 ):
     """
@@ -988,6 +1017,7 @@ def train_with_variable_context(
         max_context_length: Maximum context length to reach
         context_schedule: How to increase context ("linear", "exponential", "step")
         device: Device to train on
+        is_ddp: Whether distributed training is enabled
         **kwargs: Additional arguments for model and trainer
     """
     
@@ -1030,12 +1060,14 @@ def train_with_variable_context(
     
     # Create initial dataloaders with minimum context length
     current_context = min_context_length
-    train_loader, val_loader, test_loader = create_dataloaders(
+    (train_loader, val_loader, test_loader), (train_sampler, val_sampler, test_sampler) = create_dataloaders(
         data_dir=data_dir,
         manifest_path=manifest_path,
         batch_size=batch_size,
         sequence_length=current_context,
-        num_workers=kwargs.get('num_workers', 8)
+        num_workers=kwargs.get('num_workers', 8),
+        return_samplers=True,
+        ddp=is_ddp
     )
     
     # Initialize trainer
@@ -1085,12 +1117,14 @@ def train_with_variable_context(
                 logger.info(f"Updating context length from {current_context} to {new_context}")
                 current_context = new_context
                 
-                train_loader, val_loader, test_loader = create_dataloaders(
+                (train_loader, val_loader, test_loader), (train_sampler, val_sampler, test_sampler) = create_dataloaders(
                     data_dir=data_dir,
                     manifest_path=manifest_path,
                     batch_size=batch_size,
                     sequence_length=current_context,
-                    num_workers=kwargs.get('num_workers', 8)
+                    num_workers=kwargs.get('num_workers', 8),
+                    return_samplers=True,
+                    ddp=is_ddp
                 )
                 
                 # Update trainer's dataloaders
@@ -1103,6 +1137,15 @@ def train_with_variable_context(
                 trainer.total_training_steps = trainer.global_step + (remaining_epochs * len(train_loader))
                 logger.info(f"Updated KL annealing: will reach max at step {trainer.total_training_steps}")
         
+        # Set epoch for distributed sampler
+        if is_ddp:
+            if train_sampler:
+                train_sampler.set_epoch(epoch)
+            if val_sampler:
+                val_sampler.set_epoch(epoch)
+            if test_sampler:
+                test_sampler.set_epoch(epoch)
+        
         # Train for one epoch
         trainer.epoch = epoch
         train_metrics = trainer.train_epoch()
@@ -1114,6 +1157,10 @@ def train_with_variable_context(
             if (epoch + 1) % trainer.eval_every == 0:
                 val_metrics = trainer.evaluate(trainer.val_loader, "val")
                 logger.info(f"Epoch {epoch} - Val: {val_metrics}")
+
+                # Synchronize before saving checkpoint
+                if is_ddp:
+                    dist.barrier()
                 
                 # Save checkpoint
                 is_best = val_metrics['loss'] < trainer.best_val_loss
@@ -1146,6 +1193,11 @@ if __name__ == "__main__":
     parser.add_argument("--max_context", type=int, default=20, help="Maximum context length")
     parser.add_argument("--context_schedule", type=str, default="linear", 
                        choices=["linear", "exponential", "step"], help="Context length schedule")
+
+    # DDP arguments
+    parser.add_argument('--local_rank', type=int, default=-1, help='local rank for DistributedDataParallel')
+    parser.add_argument("--dist_backend", default=None, help="nccl|gloo")
+
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on")
     parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
@@ -1173,11 +1225,24 @@ if __name__ == "__main__":
     parser.add_argument("--attn_drop_rate", type=float, default=0.0, help="Attention dropout rate")
     
     args = parser.parse_args()
-    
-    # Setup logging
+
+    # --- DDP Initialization ---
+    is_ddp = args.local_rank != -1
+    if is_ddp:
+        dist.init_process_group(backend=args.dist_backend or ('nccl' if torch.cuda.is_available() else 'gloo'))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(args.local_rank)
+        args.device = f'cuda:{args.local_rank}' if torch.cuda.is_available() else 'cpu'
+
+    # Setup logging (show rank if DDP)
+    log_format = '%(asctime)s - %(name)s'
+    if is_ddp:
+        log_format += f' - RANK {dist.get_rank()}'
+    log_format += ' - %(levelname)s - %(message)s'
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format=log_format
     )
     
     # Override settings in test mode
@@ -1190,36 +1255,41 @@ if __name__ == "__main__":
         print(f"  - Dropout rates set to 0.0")
     
     # Train model
-    model = train_with_variable_context(
-        data_dir=args.data_dir,
-        manifest_path=args.manifest_path,
-        num_epochs=args.num_epochs,
-        batch_size=args.batch_size,
-        min_context_length=args.min_context,
-        max_context_length=args.max_context,
-        context_schedule=args.context_schedule,
-        device=args.device,
-        mixed_precision=args.mixed_precision,
-        learning_rate=args.learning_rate,
-        kl_weight=args.kl_weight,
-        num_workers=args.num_workers,
-        test_mode=args.test_mode,
-        use_scheduler=args.scheduler,
-        min_lr_ratio=args.min_lr_ratio,
-        # Rollout loss parameters
-        rollout_horizon=args.rollout_horizon,
-        rollout_weight=args.rollout_weight,
-        rollout_prob=args.rollout_prob,
-        detach_rollout_first=args.detach_rollout_first,
-        anchor_strategy=args.anchor_strategy,
-        # Model architecture parameters
-        latent_dim=args.latent_dim,
-        encoder_depth=args.encoder_depth,
-        decoder_depth=args.decoder_depth,
-        encoder_heads=args.encoder_heads,
-        decoder_heads=args.decoder_heads,
-        embed_dim=args.embed_dim,
-        mlp_ratio=args.mlp_ratio,
-        drop_rate=args.drop_rate,
-        attn_drop_rate=args.attn_drop_rate
-    )
+    try:
+        model = train_with_variable_context(
+            data_dir=args.data_dir,
+            manifest_path=args.manifest_path,
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            min_context_length=args.min_context,
+            max_context_length=args.max_context,
+            context_schedule=args.context_schedule,
+            device=args.device,
+            mixed_precision=args.mixed_precision,
+            learning_rate=args.learning_rate,
+            kl_weight=args.kl_weight,
+            num_workers=args.num_workers,
+            test_mode=args.test_mode,
+            use_scheduler=args.scheduler,
+            min_lr_ratio=args.min_lr_ratio,
+            # Rollout loss parameters
+            rollout_horizon=args.rollout_horizon,
+            rollout_weight=args.rollout_weight,
+            rollout_prob=args.rollout_prob,
+            detach_rollout_first=args.detach_rollout_first,
+            anchor_strategy=args.anchor_strategy,
+            # Model architecture parameters
+            latent_dim=args.latent_dim,
+            encoder_depth=args.encoder_depth,
+            decoder_depth=args.decoder_depth,
+            encoder_heads=args.encoder_heads,
+            decoder_heads=args.decoder_heads,
+            embed_dim=args.embed_dim,
+            mlp_ratio=args.mlp_ratio,
+            drop_rate=args.drop_rate,
+            attn_drop_rate=args.attn_drop_rate,
+            is_ddp=is_ddp
+        )
+    finally:
+        if is_ddp:
+            dist.destroy_process_group()
