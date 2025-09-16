@@ -5,7 +5,8 @@ Latent Action Model (LAM) - A VAE for learning action representations from laten
 from .modules import LAMEncoder, LAMDecoder, TransformerBlock
 from .vae import LatentActionVAE, load_model_from_config
 from .dataloader import LAMDataset, create_dataloaders
-from .training import LAMTrainer, train_with_variable_context
+# Note: Training imports removed to avoid RuntimeWarning when running training as module
+# Import LAMTrainer and train_with_variable_context directly from .training if needed
 
 __all__ = [
     'LAMEncoder', 
@@ -14,7 +15,5 @@ __all__ = [
     'LatentActionVAE',
     'load_model_from_config',
     'LAMDataset', 
-    'create_dataloaders',
-    'LAMTrainer', 
-    'train_with_variable_context'
+    'create_dataloaders'
 ]
