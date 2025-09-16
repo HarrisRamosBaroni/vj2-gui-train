@@ -826,6 +826,7 @@ class LAMTrainer:
             'model_state_dict': model_for_save.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
+            'scaler': self.scaler.state_dict() if self.mixed_precision else None,
             'config': {
                 'latent_dim': model_for_save.latent_dim,
                 'action_dim': model_for_save.action_dim,
@@ -864,14 +865,22 @@ class LAMTrainer:
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
+        if self.use_ddp:
+            dist.barrier() # Ensure all processes are ready before loading
+
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        model_to_load = self.model.module if self.use_ddp else self.model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
-        
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+
+        if self.mixed_precision and 'scaler' in checkpoint and checkpoint['scaler'] is not None:
+            self.scaler.load_state_dict(checkpoint['scaler'])
+
         logger.info(f"Loaded checkpoint from {checkpoint_path}")
         logger.info(f"Resuming from epoch {self.epoch}, step {self.global_step}")
     
