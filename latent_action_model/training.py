@@ -32,8 +32,8 @@ try:
 except ImportError:
     FVCORE_AVAILABLE = False
 
-from .vae import LatentActionVAE
-from .dataloader import create_dataloaders, LAMDataset
+from latent_action_model.vae import LatentActionVAE
+from latent_action_model.dataloader import create_dataloaders, LAMDataset
 
 
 logger = logging.getLogger(__name__)
