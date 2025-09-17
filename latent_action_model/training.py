@@ -273,7 +273,11 @@ class LAMTrainer:
         self.fixed_batch = None  # Will store the single batch in test mode
         
         self.use_wandb = use_wandb
-        if use_wandb and (not self.use_ddp or dist.get_rank() == 0):
+        
+        # In DDP mode, wandb should only be initialized on the main process (rank 0)
+        is_main_process = not self.use_ddp or dist.get_rank() == 0
+        
+        if self.use_wandb and is_main_process:
             run_name = wandb_run_name or (f"lam_test_mode_{datetime.now().strftime('%Y%m%d_%H%M%S')}" if test_mode else None)
             wandb.init(
                 project=wandb_project,
@@ -295,6 +299,9 @@ class LAMTrainer:
                 }
             )
             wandb.watch(model_for_optim, log='gradients', log_freq=500)
+        elif self.use_wandb and not is_main_process:
+            # Disable wandb on non-main processes to prevent duplicate runs
+            self.use_wandb = False
         
         # In test mode, grab and store a single batch
         if self.test_mode:
@@ -348,10 +355,12 @@ class LAMTrainer:
         input_shape = sequence_shape[1:]  # (T, N, D) - remove batch dimension
         
         try:
+            # In DDP, the model is on a specific device, get it from a parameter
+            device = next(self.model.parameters()).device
             forward_flops, backward_flops, total_flops = calculate_model_flops(
-                self.model, 
-                input_shape=input_shape, 
-                device=self.device
+                self.model.module if self.use_ddp else self.model, # unwrap for FLOPs
+                input_shape=input_shape,
+                device=device
             )
             
             # Scale by batch size (FLOPs scale linearly with batch size)
@@ -418,7 +427,12 @@ class LAMTrainer:
         self.model.train()
         
         # Move batch to device
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        # In DDP, self.device is the local rank's device, which is correct
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+
+        # DEBUG: Check tensor device
+        # if dist.is_initialized():
+        #     logger.info(f"Rank {dist.get_rank()}: Tensor device in train_step: {batch['sequence'].device}")
         
         # Apply layer normalization to input sequences (z-score normalization on D=1024)
         # This matches the preprocessing used by VJ2 predictor models
@@ -435,7 +449,7 @@ class LAMTrainer:
         # Forward pass with mixed precision
         if self.mixed_precision:
             with torch.cuda.amp.autocast():
-                loss_dict = self.model.compute_loss(
+                loss_dict = (self.model.module if self.use_ddp else self.model).compute_loss(
                     batch,
                     beta_schedule=kl_weight,
                     rollout_horizon=self.rollout_horizon,
@@ -446,7 +460,7 @@ class LAMTrainer:
                 )
                 loss = loss_dict['loss']
         else:
-            loss_dict = self.model.compute_loss(
+            loss_dict = (self.model.module if self.use_ddp else self.model).compute_loss(
                 batch,
                 beta_schedule=kl_weight,
                 rollout_horizon=self.rollout_horizon,
@@ -506,7 +520,7 @@ class LAMTrainer:
         self.model.eval()
         
         # Move batch to device
-        batch = {k: v.to(self.device) for k, v in batch.items()}
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
         
         # Apply layer normalization to input sequences (z-score normalization on D=1024)
         # This matches the preprocessing used by VJ2 predictor models
@@ -518,7 +532,7 @@ class LAMTrainer:
         # for stability (on embed_dim=512). This double normalization is intentional.
         
         # Forward pass for standard losses with rollout parameters
-        loss_dict = self.model.compute_loss(
+        loss_dict = (self.model.module if self.use_ddp else self.model).compute_loss(
             batch,
             rollout_horizon=self.rollout_horizon,
             rollout_weight=self.rollout_weight,
@@ -534,8 +548,9 @@ class LAMTrainer:
         z_target = z_sequence[:, -1, :, :]  # [B, N, D]
         
         # Get true action latents from encoder (now per-transition)
-        mu, logvar = self.model.encode(z_sequence)  # [B, T-1, A] 
-        a_true_seq = self.model.reparameterize(mu, logvar)  # [B, T-1, A]
+        model_ref = self.model.module if self.use_ddp else self.model
+        mu, logvar = model_ref.encode(z_sequence)  # [B, T-1, A]
+        a_true_seq = model_ref.reparameterize(mu, logvar)  # [B, T-1, A]
         
         # For eval, we want the action for the final transition (z_{T-1} -> z_T)
         a_true = a_true_seq[:, -1, :]  # [B, A] - last action in sequence
@@ -548,13 +563,13 @@ class LAMTrainer:
         a_perturbed = a_true + epsilon * torch.randn_like(a_true)  # [B, A]
         
         # Decode with true action
-        z_pred_true = self.model.decode(z_past, a_true)  # [B, N, D]
+        z_pred_true = model_ref.decode(z_past, a_true)  # [B, N, D]
         
-        # Decode with random action  
-        z_pred_rand = self.model.decode(z_past, a_rand)  # [B, N, D]
+        # Decode with random action
+        z_pred_rand = model_ref.decode(z_past, a_rand)  # [B, N, D]
         
         # Decode with perturbed action
-        z_pred_perturbed = self.model.decode(z_past, a_perturbed)  # [B, N, D]
+        z_pred_perturbed = model_ref.decode(z_past, a_perturbed)  # [B, N, D]
         
         # Compute distances (L2 norm in patch space)
         # Flatten patches for distance computation: [B, N*D]
@@ -1204,7 +1219,9 @@ if __name__ == "__main__":
                        choices=["linear", "exponential", "step"], help="Context length schedule")
 
     # DDP arguments
-    parser.add_argument('--local_rank', type=int, default=-1, help='local rank for DistributedDataParallel')
+    # local_rank is deprecated, but we keep it for backward compatibility.
+    # torchrun uses the LOCAL_RANK env var.
+    parser.add_argument('--local_rank', type=int, default=-1, help='local rank for DistributedDataParallel (deprecated)')
     parser.add_argument("--dist_backend", default=None, help="nccl|gloo")
 
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on")
@@ -1236,12 +1253,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- DDP Initialization ---
-    is_ddp = args.local_rank != -1
+    # torchrun provides the necessary environment variables for DDP.
+    is_ddp = 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1
     if is_ddp:
+        # The LOCAL_RANK env var is set by torchrun.
+        local_rank = int(os.environ['LOCAL_RANK'])
         dist.init_process_group(backend=args.dist_backend or ('nccl' if torch.cuda.is_available() else 'gloo'))
         if torch.cuda.is_available():
-            torch.cuda.set_device(args.local_rank)
-        args.device = f'cuda:{args.local_rank}' if torch.cuda.is_available() else 'cpu'
+            torch.cuda.set_device(local_rank)
+        # Set the device for the current process.
+        args.device = f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu'
 
     # Setup logging (show rank if DDP)
     log_format = '%(asctime)s - %(name)s'

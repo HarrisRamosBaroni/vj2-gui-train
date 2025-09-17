@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 
 class TransformerBlock(nn.Module):
@@ -196,6 +197,10 @@ class LAMEncoder(nn.Module):
                 block.mlp[-2].weight.data.div_(layer_scale)
 
     def forward(self, z_sequence):
+        # if dist.is_initialized():
+        #     import logging
+        #     logger = logging.getLogger(__name__)
+        #     logger.info(f"Rank {dist.get_rank()}: Tensor device in LAMEncoder: {z_sequence.device}")
         """
         Args:
             z_sequence: Sequence of patch tokens [B, T, N, D] where:
@@ -219,19 +224,21 @@ class LAMEncoder(nn.Module):
         # Project patch tokens to embedding dimension
         # [B, T, N, D] -> [B, T, N, embed_dim]
         x = self.patch_proj(z_sequence)
-        
+
         # Layer normalize after projection (helps with stability)
         x = F.layer_norm(x, (self.embed_dim,))
-        
+
         # Add spatial positional embeddings (same for all frames)
         # spatial_pos_embed: [N, embed_dim] -> [1, 1, N, embed_dim]
+        # Correctly unsqueeze to avoid implicit gathering in DDP
         spatial_pos = self.spatial_pos_embed.unsqueeze(0).unsqueeze(0)
-        x = x + spatial_pos  # [B, T, N, embed_dim]
-        
+        x = x + spatial_pos.to(x.device)   # [B, T, N, embed_dim]
+
         # Add temporal positional embeddings (same for all patches in a frame)
         # temporal_pos_embed: [max_seq_len, embed_dim] -> [1, T, 1, embed_dim] 
+        # Correctly unsqueeze to avoid implicit gathering in DDP
         temporal_pos = self.temporal_pos_embed[:T].unsqueeze(0).unsqueeze(2)
-        x = x + temporal_pos  # [B, T, N, embed_dim]
+        x = x + temporal_pos.to(x.device)   # [B, T, N, embed_dim]
         
         # Reshape to sequence: [B, T*N, embed_dim]
         x = x.reshape(B, T * N, self.embed_dim)
@@ -386,17 +393,19 @@ class LAMDecoder(nn.Module):
         # Project past patches to embedding dimension
         # [B, T_past, N, D] -> [B, T_past, N, embed_dim]
         z_embed = self.patch_proj(z_past)
-        
+
         # Layer normalize after projection (helps with L1 loss stability)
         z_embed = F.layer_norm(z_embed, (self.embed_dim,))
-        
+
         # Add spatial positional embeddings to past patches
+        # Correctly unsqueeze to avoid implicit gathering in DDP
         spatial_pos = self.spatial_pos_embed.unsqueeze(0).unsqueeze(0)  # [1, 1, N, embed_dim]
-        z_embed = z_embed + spatial_pos
-        
+        z_embed = z_embed + spatial_pos.to(z_embed.device)
+
         # Add temporal positional embeddings to past patches
+        # Correctly unsqueeze to avoid implicit gathering in DDP
         temporal_pos = self.temporal_pos_embed[:T_past].unsqueeze(0).unsqueeze(2)  # [1, T_past, 1, embed_dim]
-        z_embed = z_embed + temporal_pos
+        z_embed = z_embed + temporal_pos.to(z_embed.device)
         
         # Project action latent and add to all patch tokens (additive conditioning)
         action_embed = self.action_proj(action_latent)  # [B, embed_dim]
