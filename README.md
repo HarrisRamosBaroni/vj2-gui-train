@@ -21,7 +21,7 @@ wandb login
 ### Run training
 Choose `<number of devices>` and proceed with command:
 
-`PYTHONPATH=. torchrun --nproc_per_node=<number of devices> latent_action_model/train_vvae_lam.py --data_dir ./mother --manifest_path ./mother/manifests/experiment_A.json --num_epochs 100 --batch_size 7 --context_length 8 --mixed_precision --use_wandb --project_name vvae-lam --validation_fraction 0.1`
+`PYTHONPATH=. torchrun --nproc_per_node=<number of devices> latent_action_model/train_vvae_lam.py --data_dir ./mother --manifest_path ./mother/manifests/experiment_A.json --num_epochs 100 --batch_size 14 --context_length 8 --mixed_precision --use_wandb --project_name vvae-lam --validation_fraction 0.1`
 
 ---
 
