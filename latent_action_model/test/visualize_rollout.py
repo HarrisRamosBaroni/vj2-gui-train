@@ -15,8 +15,10 @@ import numpy as np
 from latent_action_model.vae import LatentActionVAE, load_lam_config
 from training.dataloader import init_preprocessed_data_loader
 from gui_world_model.jepa_decoder.model import JEPADecoder
+from gui_world_model.utils.wandb_utils import init_wandb
 import torch.nn.functional as F
-from torchvision.utils import make_grid, save_image
+from torchvision.utils import make_grid
+import wandb
 import cv2
 
 
@@ -123,6 +125,7 @@ def visualise_rollout(
     context_len: int,
     save_dir: Path,
     traj_idx: int,
+    run: "wandb.wandb_run.Run",
 ):
     """
     Renders and saves a grid of images comparing the true and predicted trajectories.
@@ -180,9 +183,23 @@ def visualise_rollout(
         )
 
     # Save the final image
-    save_path = save_dir / f"rollout_traj_{traj_idx}_ctx_{context_len}.png"
-    cv2.imwrite(str(save_path), cv2.cvtColor(grid_np, cv2.COLOR_RGB2BGR))
-    print(f"Saved visualisation grid to {save_path}")
+    log_key = f"rollout_traj_{traj_idx}_ctx_{context_len}"
+    
+    # Log to wandb
+    run.log({
+        log_key: wandb.Image(
+            grid_np,
+            caption=f"Trajectory {traj_idx}, Context Length: {context_len}"
+        )
+    })
+    
+    print(f"Logged visualization to wandb with key: {log_key}")
+
+    # Optionally save locally as well
+    if save_dir:
+        save_path = save_dir / f"{log_key}.png"
+        cv2.imwrite(str(save_path), cv2.cvtColor(grid_np, cv2.COLOR_RGB2BGR))
+        print(f"Saved visualization grid to {save_path}")
 
 
 def main(args):
@@ -190,7 +207,15 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    args.save_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_dir:
+        args.save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize wandb
+    run = init_wandb(
+        project_name=args.wandb_project,
+        run_name=f"rollout_viz_traj_{args.trajectory_index}",
+        config=vars(args)
+    )
 
     # 1. Load models
     vae = load_vae_model(args.vae_ckpt, args.vae_config, device)
@@ -218,7 +243,10 @@ def main(args):
             i,
             args.save_dir,
             args.trajectory_index,
+            run,
         )
+    
+    run.finish()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Autoregressive rollout for LatentActionVAE.")
@@ -238,7 +266,10 @@ if __name__ == '__main__':
     parser.add_argument("--min_context_len", type=int, default=1, help="Number of initial frames to use as context.")
 
     # Arguments for output
-    parser.add_argument("--save_dir", type=Path, required=True, help="Directory to save the visualization.")
+    parser.add_argument("--save_dir", type=Path, default=None, help="Directory to save the visualization locally (optional).")
+    
+    # Wandb arguments
+    parser.add_argument("--wandb_project", type=str, default="latent_action_rollouts", help="Wandb project name.")
 
     args = parser.parse_args()
     

@@ -15,6 +15,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from logging import getLogger
@@ -22,7 +23,7 @@ from logging import getLogger
 # Project modules
 from latent_action_model.vae import LatentActionVAE, load_lam_config
 from training.dataloader import init_preprocessed_data_loader
-from gui_world_model.jepa_decoder.model import JEPADecoder  # optional – guarded
+from gui_world_model.jepa_decoder_diffusion.model import JEPADecoder, JEPADiffusionDecoder
 
 logger = getLogger(__name__)
 
@@ -55,15 +56,22 @@ def load_vae_model(ckpt_path: Path, config_path: Path, device: torch.device) -> 
     return model
 
 
-def load_jepa_decoder(dec_ckpt: Path, device: torch.device) -> JEPADecoder:
-    """Load JEPA decoder for RGB visualisation."""
+def load_decoder(dec_ckpt: Path, device: torch.device, decoder_type: str) -> nn.Module:
+    """Load a decoder model for RGB visualisation."""
     checkpoint = torch.load(dec_ckpt, map_location=device, weights_only=True)
     cfg = checkpoint.get("config", {})
     latent_dim = cfg.get("latent_dim", 1024)
-    model = JEPADecoder(latent_dim=latent_dim, output_resolution=250).to(device)
+    
+    if decoder_type == "diffusion":
+        model = JEPADiffusionDecoder(latent_dim=latent_dim, output_resolution=256).to(device)
+        logger.info("Loading JEPADiffusionDecoder...")
+    else:
+        model = JEPADecoder(latent_dim=latent_dim, output_resolution=250).to(device)
+        logger.info("Loading JEPADecoder...")
+
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    logger.info(f"Loaded JEPA decoder from {dec_ckpt}")
+    logger.info(f"Loaded {decoder_type} decoder from {dec_ckpt}")
     return model
 
 
@@ -81,18 +89,27 @@ def save_histogram(values: np.ndarray, out_path: Path, title: str, xlabel: str):
 
 
 def visualise_predictions(
-    decoder: JEPADecoder,
+    decoder: nn.Module,
     latents: torch.Tensor,
     out_path: Path,
     labels: list[str],
+    decoder_type: str,
+    num_inference_steps: int,
 ):
     """
     Render RGB reconstructions for a series of latents and save grid.
     """
-    from torchvision.utils import make_grid, save_image  # runtime import
+    from torchvision.utils import make_grid
     import cv2
 
-    imgs = decoder(latents.to(decoder.final_conv[0].weight.device))  # [K, 3, H, W]
+    device = next(decoder.parameters()).device
+    latents = latents.to(device)
+
+    if decoder_type == "diffusion":
+        imgs = decoder.sample_ddim(latents, num_inference_steps=num_inference_steps)
+    else:
+        imgs = decoder(latents)
+
     grid = make_grid(imgs, nrow=latents.shape[0], normalize=True, value_range=(-1, 1))
 
     # Add labels
@@ -122,8 +139,10 @@ def analyse_random_action_sensitivity(
     num_initial: int,
     num_random: int,
     output_dir: Path,
-    decoder: JEPADecoder = None,
+    decoder: nn.Module = None,
     mode: str = "random_action",
+    decoder_type: str = "original",
+    num_inference_steps: int = 50,
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(0)
@@ -158,7 +177,14 @@ def analyse_random_action_sensitivity(
             vis_path = output_dir / f"transition_{idx}.png"
             latents_to_viz = torch.stack([z_t, z_hat_tplus1, z_tplus1_actual], dim=0)
             labels = ["z_t (current)", "z_hat_t+1 (predicted)", "z_t+1 (actual)"]
-            visualise_predictions(decoder, latents_to_viz, vis_path, labels)
+            visualise_predictions(
+                decoder,
+                latents_to_viz,
+                vis_path,
+                labels,
+                decoder_type,
+                num_inference_steps,
+            )
             
             if (idx + 1) % 10 == 0:
                 logger.info(f"Generated {idx+1}/{num_initial} transition visualizations.")
@@ -233,6 +259,8 @@ def parse_args():
     p.add_argument("--num_initial", type=int, default=100, help="# anchor states or # examples")
     p.add_argument("--num_random", type=int, default=50, help="# random actions per anchor (for random_action mode)")
     p.add_argument("--decoder_ckpt", type=Path, default=None, help="JEPA decoder ckpt (required for visualize_transition)")
+    p.add_argument("--decoder_type", type=str, default="original", choices=["original", "diffusion"], help="Type of decoder model to load.")
+    p.add_argument("--num_inference_steps", type=int, default=50, help="Number of DDIM inference steps for diffusion decoder.")
     p.add_argument("--output_dir", type=Path, default=Path("ras_outputs"), help="Where to save results")
     p.add_argument("--device", type=str, default="cuda", help="Device (cuda|cpu)")
     return p.parse_args()
@@ -257,7 +285,7 @@ def main():
     # 3) optional decoder
     decoder = None
     if args.decoder_ckpt:
-        decoder = load_jepa_decoder(args.decoder_ckpt, device)
+        decoder = load_decoder(args.decoder_ckpt, device, args.decoder_type)
 
     # 4) analysis
     analyse_random_action_sensitivity(
@@ -269,6 +297,8 @@ def main():
         output_dir=args.output_dir,
         decoder=decoder,
         mode=args.mode,
+        decoder_type=args.decoder_type,
+        num_inference_steps=args.num_inference_steps,
     )
     logger.info("Analysis complete.")
 

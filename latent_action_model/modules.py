@@ -22,17 +22,22 @@ class TransformerBlock(nn.Module):
             nn.Dropout(drop)
         )
         
-    def forward(self, x):
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input tensor [B, L, D]
+            mask: Optional attention mask [L, L] where mask[i,j] = -inf blocks attention from i to j
+        """
         # Self-attention with residual connection
         y = self.norm1(x)
-        y, _ = self.attn(y, y, y)
+        y, _ = self.attn(y, y, y, attn_mask=mask)
         x = x + y
-        
+
         # MLP with residual connection
         y = self.norm2(x)
         y = self.mlp(y)
         x = x + y
-        
+
         return x
 
 

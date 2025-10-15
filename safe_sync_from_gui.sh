@@ -29,6 +29,7 @@ FILES_TO_SYNC=(
     "training/train_v2.py"
     "training/utils.py"
     "preprocess/generate_split_manifest.py"
+    "vvae/"
     # ".gitignore"
     # "RCLONE_README.md"
     # "TRAIN_README.md"

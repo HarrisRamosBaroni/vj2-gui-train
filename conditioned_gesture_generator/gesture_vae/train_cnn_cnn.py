@@ -2,13 +2,16 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
+import h5py
 from tqdm import tqdm
 import argparse
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import random
 
 from .model_cnn_cnn import CNNCNNVAE, LightweightCNNCNNVAE
 from .data_loader import StreamingGestureDataLoader
@@ -18,6 +21,206 @@ from .utils import (CoordinateQuantizer, CheckpointManager, ExperimentLogger, Vi
                    parse_validation_interval, generate_reconstructed_trajectories, 
                    generate_sampled_trajectories)
 from .monitoring import VAEMonitor, integrate_monitor_into_training
+from conditioned_gesture_generator.train_cnn_gesture_classifier_no_int import H5ActionSequenceDataset
+
+
+DEFAULT_ZERO_DROP_PROB = 0.8
+
+
+class XYOnlyGestureDataset(Dataset):
+    """Wrap gesture datasets to expose only x/y channels."""
+
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        sequence = self.base_dataset[idx]
+        if sequence.shape[-1] > 2:
+            sequence = sequence[..., :2]
+        return sequence
+
+
+class ZeroSuppressionDataset(Dataset):
+    """Probabilistically skip all-zero trajectories to emphasize informative samples."""
+
+    def __init__(self, base_dataset, drop_prob: float = DEFAULT_ZERO_DROP_PROB, max_retries: int = 10):
+        self.base_dataset = base_dataset
+        self.drop_prob = drop_prob
+        self.max_retries = max_retries
+        self.sequence_length = getattr(base_dataset, "sequence_length", None)
+        self.num_channels = getattr(base_dataset, "num_channels", None)
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def _is_all_zero(self, sequence: torch.Tensor) -> bool:
+        if not torch.is_tensor(sequence):
+            sequence = torch.as_tensor(sequence)
+        xy = sequence[..., :2] if sequence.shape[-1] >= 2 else sequence
+        return bool(torch.all(xy == 0))
+
+    def __getitem__(self, idx):
+        next_idx = idx
+        sequence = None
+        for _ in range(self.max_retries):
+            sequence = self.base_dataset[next_idx]
+            if self._is_all_zero(sequence) and random.random() < self.drop_prob:
+                next_idx = random.randint(0, len(self.base_dataset) - 1)
+                continue
+            return sequence
+        return sequence
+
+    def __getattr__(self, name):
+        return getattr(self.base_dataset, name)
+
+
+def _resolve_h5_files(processed_data_dir: Path, file_whitelist: Optional[List[str]]) -> List[Path]:
+    if file_whitelist:
+        candidates = [processed_data_dir / fname for fname in file_whitelist]
+    else:
+        candidates = sorted(processed_data_dir.glob('*.h5'))
+
+    existing: List[Path] = []
+    missing: List[Path] = []
+    for candidate in candidates:
+        if candidate.exists():
+            existing.append(candidate)
+        else:
+            missing.append(candidate)
+
+    if missing:
+        print(f"Warning: Skipping missing files: {[p.name for p in missing]}")
+
+    if not existing:
+        raise FileNotFoundError(f"No HDF5 files found in {processed_data_dir}")
+
+    return existing
+
+
+def _load_file_whitelist(manifest_path: Optional[str], split: Optional[str]) -> Optional[List[str]]:
+    if not manifest_path or not split:
+        return None
+    manifest_file = Path(manifest_path)
+    if not manifest_file.exists():
+        raise FileNotFoundError(f"Manifest file {manifest_file} does not exist")
+    with manifest_file.open('r') as f:
+        manifest = json.load(f)
+    if 'splits' not in manifest:
+        raise KeyError(f"Manifest at {manifest_file} missing 'splits' key")
+    if split not in manifest['splits']:
+        raise ValueError(
+            f"Split '{split}' not found in manifest; available splits: {list(manifest['splits'].keys())}"
+        )
+    return manifest['splits'][split]
+
+
+def _dataset_has_embeddings(processed_data_dir: Path, file_whitelist: Optional[List[str]]) -> bool:
+    files = _resolve_h5_files(processed_data_dir, file_whitelist)
+    for file_path in files:
+        with h5py.File(file_path, 'r') as f:
+            if 'embeddings' in f:
+                return True
+            if 'actions' in f and 'embeddings' not in f:
+                return False
+    return False
+
+
+class H5ActionsOnlySequenceDataset(Dataset):
+    """Expose individual action segments when embeddings are unavailable."""
+
+    def __init__(self, processed_data_dir: Path, file_whitelist: Optional[List[str]] = None):
+        self.data_dir = processed_data_dir
+        self.h5_files = _resolve_h5_files(processed_data_dir, file_whitelist)
+        self._file_handles: Dict[int, Dict[str, h5py.File]] = {}
+        self.segment_index: List[Tuple[str, Optional[int], int]] = []
+        self.sequence_length: Optional[int] = None
+        self.num_channels: Optional[int] = None
+
+        for file_path in self.h5_files:
+            with h5py.File(file_path, 'r') as f:
+                if 'actions' not in f:
+                    print(f"Warning: HDF5 file {file_path} missing 'actions' dataset; skipping")
+                    continue
+                actions_ds = f['actions']
+                if actions_ds.ndim == 4:
+                    num_traj, num_segments, seq_len, channels = actions_ds.shape
+                    if self.sequence_length is None:
+                        self.sequence_length = seq_len
+                        self.num_channels = channels
+                    elif seq_len != self.sequence_length or channels != self.num_channels:
+                        raise ValueError(
+                            "Inconsistent action shape detected. "
+                            f"Expected ({self.sequence_length}, {self.num_channels}) but found "
+                            f"({seq_len}, {channels}) in {file_path}"
+                        )
+                    for traj_idx in range(num_traj):
+                        for seg_idx in range(num_segments):
+                            self.segment_index.append((str(file_path), traj_idx, seg_idx))
+                elif actions_ds.ndim == 3:
+                    num_segments, seq_len, channels = actions_ds.shape
+                    if self.sequence_length is None:
+                        self.sequence_length = seq_len
+                        self.num_channels = channels
+                    elif seq_len != self.sequence_length or channels != self.num_channels:
+                        raise ValueError(
+                            "Inconsistent action shape detected. "
+                            f"Expected ({self.sequence_length}, {self.num_channels}) but found "
+                            f"({seq_len}, {channels}) in {file_path}"
+                        )
+                    for seg_idx in range(num_segments):
+                        self.segment_index.append((str(file_path), None, seg_idx))
+                else:
+                    raise ValueError(
+                        f"Expected 3D or 4D 'actions' dataset in {file_path}, found shape {actions_ds.shape}"
+                    )
+
+        if not self.segment_index:
+            raise ValueError("No action segments found in the provided HDF5 data")
+
+    def __len__(self) -> int:
+        return len(self.segment_index)
+
+    def _get_file_handle(self, file_path: str) -> h5py.File:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        if worker_id not in self._file_handles:
+            self._file_handles[worker_id] = {}
+        if file_path not in self._file_handles[worker_id]:
+            self._file_handles[worker_id][file_path] = h5py.File(file_path, 'r')
+        return self._file_handles[worker_id][file_path]
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        file_path, traj_idx, seg_idx = self.segment_index[idx]
+        h5_file = self._get_file_handle(file_path)
+        actions_ds = h5_file['actions']
+        if traj_idx is None:
+            action_np = actions_ds[seg_idx]
+        else:
+            action_np = actions_ds[traj_idx, seg_idx]
+        return torch.from_numpy(np.array(action_np, copy=True)).float()
+
+
+def create_h5_sequence_dataset(
+    processed_data_dir: str,
+    manifest_path: Optional[str],
+    split: Optional[str],
+    file_whitelist: Optional[List[str]] = None,
+) -> Dataset:
+    processed_path = Path(processed_data_dir)
+    whitelist = file_whitelist if file_whitelist is not None else _load_file_whitelist(manifest_path, split)
+    if _dataset_has_embeddings(processed_path, whitelist):
+        return H5ActionSequenceDataset(
+            processed_data_dir=processed_data_dir,
+            manifest_path=manifest_path,
+            split=split,
+        )
+    return H5ActionsOnlySequenceDataset(
+        processed_data_dir=processed_path,
+        file_whitelist=whitelist,
+    )
 
 
 def train_epoch(model, train_loader, optimizer, loss_fn, quantizer, device, 
@@ -368,12 +571,22 @@ def main():
     parser = argparse.ArgumentParser(description='Train CNN-CNN VAE')
     
     # Data arguments
-    parser.add_argument('--data_path', type=str, required=True,
-                       help='Data directory path')
+    parser.add_argument('--data_path', type=str, default=None,
+                       help='Data directory path (legacy .npy datasets)')
+    parser.add_argument('--processed_data_dir', type=str, default=None,
+                       help='Directory containing preprocessed HDF5 trajectories (actions)')
+    parser.add_argument('--processed_val_dir', type=str, default=None,
+                       help='Optional directory for validation trajectories (defaults to processed_data_dir)')
+    parser.add_argument('--manifest', type=str, default=None,
+                       help='Manifest JSON describing dataset splits for HDF5 trajectories')
+    parser.add_argument('--manifest_train_split', type=str, default='train',
+                       help="Split name from manifest for training data (default: 'train')")
+    parser.add_argument('--manifest_val_split', type=str, default='validation',
+                       help="Split name from manifest for validation data (default: 'validation')")
     parser.add_argument('--val_data', type=str, default=None,
-                       help='Validation data directory (if provided, uses manual split)')
+                       help='Validation data directory (legacy .npy datasets; if provided, uses manual split)')
     parser.add_argument('--val_split', type=float, default=0.2,
-                       help='Auto validation split ratio when --val_data not provided (0.0-1.0, default: 0.2)')
+                       help='Auto validation split ratio when val data not provided (0.0-1.0, default: 0.2)')
     parser.add_argument('--no_val', action='store_true',
                        help='Skip validation entirely (faster training, no validation metrics)')
     
@@ -523,105 +736,81 @@ def main():
     
     visualizer = Visualizer(save_dir=str(checkpoint_dir / 'visualizations'))
     
+    # Determine dataset configuration
+    using_h5 = args.processed_data_dir is not None
+    if using_h5 and args.processed_val_dir is None:
+        args.processed_val_dir = args.processed_data_dir
+    
+    if using_h5 and args.data_path:
+        print("Warning: Both --processed_data_dir and --data_path provided. Using HDF5 dataset and ignoring --data_path.")
+    if not using_h5 and args.data_path is None:
+        parser.error("Either --processed_data_dir or --data_path must be specified")
+
+    # Validate paths for HDF5 workflow
+    if using_h5:
+        if not Path(args.processed_data_dir).exists():
+            parser.error(f"Processed data directory {args.processed_data_dir} does not exist")
+        if args.processed_val_dir and not Path(args.processed_val_dir).exists():
+            parser.error(f"Validation processed directory {args.processed_val_dir} does not exist")
+        if args.manifest and not Path(args.manifest).exists():
+            parser.error(f"Manifest file {args.manifest} does not exist")
+
     # Create data loaders with automatic train/val splitting
     print("Creating data loaders...")
-    
-    if args.no_val:
-        # No validation - just training
-        print("Validation disabled - training only mode")
-        train_loader_manager = StreamingGestureDataLoader(
-            train_path=args.data_path,
-            val_path=None,
-            batch_size=args.batch_size,
-            sequence_length=250,
-            normalize=True,
-            num_workers=args.num_workers,
-            shuffle=True
+
+    train_loader_manager = None
+    val_loader_manager = None
+
+    if using_h5:
+        # HDF5-based action sequences
+        print("Using HDF5 action sequences for training")
+
+        base_train_dataset = create_h5_sequence_dataset(
+            processed_data_dir=args.processed_data_dir,
+            manifest_path=args.manifest,
+            split=args.manifest_train_split if args.manifest else None
         )
-        
-        try:
-            train_loader = train_loader_manager.get_train_loader()
-            val_loader = None
-        except ValueError:
-            print(f"Error: Could not create training data loader from {args.data_path}")
-            return
-        
-    elif args.val_data:
-        # Manual validation data provided
-        print(f"Using manual train/val split:")
-        print(f"  Train data: {args.data_path}")
-        print(f"  Val data: {args.val_data}")
-        
-        train_loader_manager = StreamingGestureDataLoader(
-            train_path=args.data_path,
-            val_path=None,
-            batch_size=args.batch_size,
-            sequence_length=250,
-            normalize=True,
-            num_workers=args.num_workers,
-            shuffle=True
-        )
-        
-        val_loader_manager = StreamingGestureDataLoader(
-            train_path=None,
-            val_path=args.val_data,
-            batch_size=args.batch_size,
-            sequence_length=250,
-            normalize=True,
-            num_workers=args.num_workers,
-            shuffle=False
-        )
-        
-        try:
-            train_loader = train_loader_manager.get_train_loader()
-        except ValueError:
-            print(f"Error: Could not create training data loader from {args.data_path}")
-            return
-        
-        try:
-            val_loader = val_loader_manager.get_val_loader()
-        except ValueError:
-            print(f"Error: Could not create validation data loader from {args.val_data}")
-            val_loader = None
-            
-    else:
-        # Automatic train/val split from training data
-        print(f"Creating automatic train/val split ({1-args.val_split:.1%}/{args.val_split:.1%})")
-        print(f"Data source: {args.data_path}")
-        
-        # Create a single dataset manager to get the full dataset
-        full_loader_manager = StreamingGestureDataLoader(
-            train_path=args.data_path,
-            val_path=None,
-            batch_size=args.batch_size,
-            sequence_length=250,
-            normalize=True,
-            num_workers=args.num_workers,
-            shuffle=True
-        )
-        
-        try:
-            # Get the full dataset (before creating data loader)
-            full_dataset = full_loader_manager.train_dataset
-            if full_dataset is None:
-                raise ValueError("Could not create dataset")
-            
-            # Split dataset
+        train_dataset = XYOnlyGestureDataset(base_train_dataset)
+
+        if args.no_val:
+            print("Validation disabled - training only mode")
+            val_dataset = None
+        elif args.manifest:
+            val_base_dataset = create_h5_sequence_dataset(
+                processed_data_dir=args.processed_val_dir,
+                manifest_path=args.manifest,
+                split=args.manifest_val_split
+            )
+            val_dataset = XYOnlyGestureDataset(val_base_dataset)
+        elif args.processed_val_dir and args.processed_val_dir != args.processed_data_dir:
+            val_base_dataset = create_h5_sequence_dataset(
+                processed_data_dir=args.processed_val_dir,
+                manifest_path=None,
+                split=None
+            )
+            val_dataset = XYOnlyGestureDataset(val_base_dataset)
+        else:
+            # Fallback: create random split from training dataset
+            print(f"Creating automatic train/val split ({1-args.val_split:.1%}/{args.val_split:.1%}) from HDF5 dataset")
             train_dataset, val_dataset = create_train_val_split(
-                full_dataset, val_split=args.val_split, seed=42
+                train_dataset, val_split=args.val_split, seed=42
             )
-            
-            # Create data loaders from split datasets
-            from torch.utils.data import DataLoader
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=args.num_workers,
-                pin_memory=True,
-                drop_last=True
-            )
-            
+
+        train_dataset = ZeroSuppressionDataset(
+            train_dataset,
+            drop_prob=DEFAULT_ZERO_DROP_PROB
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+
+        if val_dataset is not None:
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=args.batch_size,
@@ -630,21 +819,172 @@ def main():
                 pin_memory=True,
                 drop_last=False
             )
-            
-        except ValueError as e:
-            print(f"Error: Could not create automatic train/val split: {e}")
-            return
+        else:
+            val_loader = None
+
+    else:
+        # Legacy numpy-based streaming loader paths
+        if args.no_val:
+            # No validation - just training
+            print("Validation disabled - training only mode")
+            train_loader_manager = StreamingGestureDataLoader(
+                train_path=args.data_path,
+                val_path=None,
+                batch_size=args.batch_size,
+                sequence_length=250,
+                normalize=True,
+                num_workers=args.num_workers,
+                shuffle=True
+            )
+
+            try:
+                base_train_dataset = train_loader_manager.train_dataset
+                if base_train_dataset is None:
+                    raise ValueError("train dataset unavailable")
+                train_dataset = ZeroSuppressionDataset(
+                    base_train_dataset,
+                    drop_prob=DEFAULT_ZERO_DROP_PROB
+                )
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=train_loader_manager.shuffle,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=True
+                )
+                val_loader = None
+            except ValueError:
+                print(f"Error: Could not create training data loader from {args.data_path}")
+                return
+
+        elif args.val_data:
+            # Manual validation data provided
+            print(f"Using manual train/val split:")
+            print(f"  Train data: {args.data_path}")
+            print(f"  Val data: {args.val_data}")
+
+            train_loader_manager = StreamingGestureDataLoader(
+                train_path=args.data_path,
+                val_path=None,
+                batch_size=args.batch_size,
+                sequence_length=250,
+                normalize=True,
+                num_workers=args.num_workers,
+                shuffle=True
+            )
+
+            val_loader_manager = StreamingGestureDataLoader(
+                train_path=None,
+                val_path=args.val_data,
+                batch_size=args.batch_size,
+                sequence_length=250,
+                normalize=True,
+                num_workers=args.num_workers,
+                shuffle=False
+            )
+
+            try:
+                base_train_dataset = train_loader_manager.train_dataset
+                if base_train_dataset is None:
+                    raise ValueError("train dataset unavailable")
+                train_dataset = ZeroSuppressionDataset(
+                    base_train_dataset,
+                    drop_prob=DEFAULT_ZERO_DROP_PROB
+                )
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=train_loader_manager.shuffle,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=True
+                )
+            except ValueError:
+                print(f"Error: Could not create training data loader from {args.data_path}")
+                return
+
+            try:
+                val_loader = val_loader_manager.get_val_loader()
+            except ValueError:
+                print(f"Error: Could not create validation data loader from {args.val_data}")
+                val_loader = None
+
+        else:
+            # Automatic train/val split from training data
+            print(f"Creating automatic train/val split ({1-args.val_split:.1%}/{args.val_split:.1%})")
+            print(f"Data source: {args.data_path}")
+
+            # Create a single dataset manager to get the full dataset
+            full_loader_manager = StreamingGestureDataLoader(
+                train_path=args.data_path,
+                val_path=None,
+                batch_size=args.batch_size,
+                sequence_length=250,
+                normalize=True,
+                num_workers=args.num_workers,
+                shuffle=True
+            )
+
+            try:
+                # Get the full dataset (before creating data loader)
+                full_dataset = full_loader_manager.train_dataset
+                if full_dataset is None:
+                    raise ValueError("Could not create dataset")
+
+                # Split dataset
+                train_dataset, val_dataset = create_train_val_split(
+                    full_dataset, val_split=args.val_split, seed=42
+                )
+
+                train_dataset = ZeroSuppressionDataset(
+                    train_dataset,
+                    drop_prob=DEFAULT_ZERO_DROP_PROB
+                )
+
+                # Create data loaders from split datasets
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=True
+                )
+
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=False
+                )
+
+            except ValueError as e:
+                print(f"Error: Could not create automatic train/val split: {e}")
+                return
     
     # Print data loader info
-    if hasattr(locals().get('train_loader_manager'), 'get_data_info'):
-        data_info = train_loader_manager.get_data_info()
-        print(f"Data info: {data_info}")
-    
-    print(f"Train batches per epoch: {len(train_loader)}")
-    if val_loader:
-        print(f"Val batches per epoch: {len(val_loader)}")
+    if using_h5:
+        train_len = len(train_loader.dataset)
+        print(f"Train sequences: {train_len}")
+        print(f"Train batches per epoch: {len(train_loader)}")
+        if val_loader:
+            print(f"Val sequences: {len(val_loader.dataset)}")
+            print(f"Val batches per epoch: {len(val_loader)}")
+        else:
+            print("No validation data - training only")
     else:
-        print("No validation data - training only")
+        if hasattr(locals().get('train_loader_manager'), 'get_data_info'):
+            data_info = train_loader_manager.get_data_info()
+            print(f"Data info: {data_info}")
+        
+        print(f"Train batches per epoch: {len(train_loader)}")
+        if val_loader:
+            print(f"Val batches per epoch: {len(val_loader)}")
+        else:
+            print("No validation data - training only")
     
     # Create model
     print("Creating model...")

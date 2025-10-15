@@ -480,6 +480,32 @@ if __name__ == "__main__":
     print(f"\nTotal parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
 
+def load_lam_config(path: str) -> dict:
+    import yaml
+    # Load YAML
+    with open(path, "r") as f:
+        data = yaml.safe_load(f)
+
+    # Get the dynamic run info (the first entry under "_wandb -> value -> e")
+    e_dict = data["_wandb"]["value"]["e"]
+    run_info = next(iter(e_dict.values()))  # works even if key is random
+
+    # Parse args into a dict
+    args = run_info["args"]
+    arg_dict = {args[i].lstrip("-"): args[i+1] for i in range(0, len(args), 2)}
+
+    # Build lam_config
+    lam_config = {
+        "latent_dim": data["latent_dim"]["value"],
+        "action_dim": data["action_dim"]["value"],
+        "embed_dim": int(arg_dict["embed_dim"]),
+        "encoder_depth": int(arg_dict["encoder_depth"]),
+        "decoder_depth": int(arg_dict["decoder_depth"]),
+        "encoder_heads": int(arg_dict["encoder_heads"]),
+        "decoder_heads": int(arg_dict["decoder_heads"]),
+        "kl_weight": float(arg_dict["kl_weight"]),
+    }
+    return lam_config
 
 def load_model_from_config(config_path: str, checkpoint_path: str, device: str = "cuda") -> LatentActionVAE:
     """

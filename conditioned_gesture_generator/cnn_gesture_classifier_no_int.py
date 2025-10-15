@@ -4,19 +4,231 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 import sys
 import os
+import math
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
+# Import TransformerBlock from latent_action_model
+from latent_action_model.modules import TransformerBlock
+
+class SinusoidalPositionalEmbedding(nn.Module):
+    """Sinusoidal positional encoding compatible with CNN inputs."""
+
+    def __init__(self, embedding_dim: int, max_len: int = 5000):
+        super().__init__()
+        if embedding_dim % 2 != 0:
+            raise ValueError("Sinusoidal positional embeddings require an even embedding_dim")
+
+        self.embedding_dim = embedding_dim
+        self.max_len = max_len
+
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, embedding_dim, 2, dtype=torch.float32)
+            * (-math.log(10000.0) / embedding_dim)
+        )
+
+        pe = torch.zeros(max_len, embedding_dim, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)  # [1, max_len, embedding_dim]
+
+    def forward(
+        self,
+        length: int,
+        *,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        if length > self.max_len:
+            raise ValueError(
+                f"Requested positional encoding length {length} exceeds maximum {self.max_len}"
+            )
+
+        embeddings = self.pe[:, :length]
+        if device is not None:
+            embeddings = embeddings.to(device)
+        if dtype is not None and embeddings.dtype != dtype:
+            embeddings = embeddings.to(dtype)
+        return embeddings
+
+class ResidualBlock1D(nn.Module):
+    def __init__(self, channels, dropout=0.1):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(channels),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(x + self.conv(x))
+
+
+class ResidualUpsampleBlock1D(nn.Module):
+    """Upsample by interpolation followed by a residual refinement block."""
+
+    def __init__(self, channels: int, dropout: float = 0.1):
+        super().__init__()
+        self.channels = channels
+        self.residual = ResidualBlock1D(channels, dropout=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode='linear', align_corners=False)
+        return self.residual(x)
+
+
+class TFMDecoder(nn.Module):
+    """
+    Transformer-based decoder for gesture classification.
+
+    Architecture:
+    - Learned embedding sequence [T=250, d_model] acting as shape anchor
+    - Add latent action vector (broadcast to all timesteps)
+    - Add sinusoidal positional encoding
+    - Pass through N TransformerBlock layers with residual connections
+    - Final classification head outputs [B, T, 2, num_classes]
+    """
+
+    def __init__(
+        self,
+        sequence_length: int = 250,
+        latent_dim: int = 128,
+        num_classes: int = 3000,
+        d_model: int = 512,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        attn_dropout: float = 0.1,
+    ):
+        """
+        Args:
+            sequence_length: Target sequence length (T=250)
+            latent_dim: Dimension of input latent vector from CNN encoder
+            num_classes: Number of classes for coordinate quantization
+            d_model: Transformer model dimension
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+            mlp_ratio: MLP hidden dimension multiplier
+            dropout: Dropout rate
+            attn_dropout: Attention dropout rate
+        """
+        super().__init__()
+
+        self.sequence_length = sequence_length
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+        self.d_model = d_model
+        self.num_layers = num_layers
+
+        # Learned embedding sequence acting as shape anchor
+        self.shape_anchor = nn.Parameter(torch.randn(sequence_length, d_model))
+
+        # Project latent action vector to model dimension
+        self.latent_proj = nn.Linear(latent_dim, d_model)
+
+        # Sinusoidal positional embedding
+        self.positional_embedding = SinusoidalPositionalEmbedding(
+            embedding_dim=d_model,
+            max_len=sequence_length
+        )
+
+        # Transformer layers
+        self.transformer_layers = nn.ModuleList([
+            TransformerBlock(
+                dim=d_model,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                attn_drop=attn_dropout,
+                drop=dropout
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Final layer normalization
+        self.norm = nn.LayerNorm(d_model)
+
+        # Classification heads for x and y coordinates
+        self.x_classifier = nn.Linear(d_model, num_classes)
+        self.y_classifier = nn.Linear(d_model, num_classes)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights following best practices."""
+        # Initialize shape anchor
+        nn.init.trunc_normal_(self.shape_anchor, std=0.02)
+
+        # Initialize linear layers
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        """
+        Decode latent vector to classification logits using transformer architecture.
+
+        Args:
+            latent: Latent vector [B, latent_dim]
+
+        Returns:
+            logits: Classification logits [B, T, 2, num_classes]
+        """
+        B = latent.shape[0]
+
+        # Start with learned embedding sequence (shape anchor)
+        # [T, d_model] -> [B, T, d_model]
+        x = self.shape_anchor.unsqueeze(0).expand(B, -1, -1)
+
+        # Project latent action vector and add to all timesteps
+        # [B, latent_dim] -> [B, d_model] -> [B, 1, d_model] -> [B, T, d_model]
+        latent_projected = self.latent_proj(latent)  # [B, d_model]
+        latent_broadcasted = latent_projected.unsqueeze(1).expand(-1, self.sequence_length, -1)  # [B, T, d_model]
+        x = x + latent_broadcasted
+
+        # Add sinusoidal positional encoding
+        positional_encoding = self.positional_embedding(
+            self.sequence_length,
+            device=x.device,
+            dtype=x.dtype
+        )  # [1, T, d_model]
+        x = x + positional_encoding
+
+        # Pass through transformer layers with residual connections
+        for transformer_layer in self.transformer_layers:
+            x = transformer_layer(x)
+
+        # Final layer normalization
+        x = self.norm(x)  # [B, T, d_model]
+
+        # Apply classification heads
+        x_logits = self.x_classifier(x)  # [B, T, num_classes]
+        y_logits = self.y_classifier(x)  # [B, T, num_classes]
+
+        # Stack to get [B, T, 2, num_classes]
+        logits = torch.stack([x_logits, y_logits], dim=2)  # [B, T, 2, num_classes]
+
+        return logits
 
 class CNNGestureClassifier(nn.Module):
     """
     CNN-based gesture classifier for time series data [T=250, 2].
-    
+
     Architecture:
     - CNN Encoder: 1D CNN layers -> flatten -> MLP -> LayerNorm -> latent vector
-    - MLP Decoder: latent -> MLP -> separate x/y classification heads [T, 2, 3000]
+    - Decoder: Either MLP-based CNN decoder OR transformer-based decoder (TFMDecoder)
     """
-    
+
     def __init__(
         self,
         input_dim: int = 2,  # x, y coordinates (ignoring pressure)
@@ -24,12 +236,19 @@ class CNNGestureClassifier(nn.Module):
         latent_dim: int = 128,
         num_classes: int = 3000,
         encoder_channels: list = [64, 128, 256, 512],
-        decoder_channels: list = [512, 256, 128, 64],
+        decoder_channels: list = [512, 256, 128, 64, 64, 64, 64, 64],
         kernel_size: int = 5,
         dropout: float = 0.1,
+        use_tfm_decoder: bool = False,
+        tfm_d_model: int = 512,
+        tfm_num_layers: int = 6,
+        tfm_num_heads: int = 8,
+        tfm_mlp_ratio: float = 4.0,
+        tfm_dropout: float = 0.1,
+        tfm_attn_dropout: float = 0.1,
     ):
         super().__init__()
-        
+
         self.input_dim = input_dim
         self.sequence_length = sequence_length
         self.latent_dim = latent_dim
@@ -37,6 +256,18 @@ class CNNGestureClassifier(nn.Module):
         self.encoder_channels = encoder_channels
         self.decoder_channels = decoder_channels
         self.kernel_size = kernel_size
+        self.use_tfm_decoder = use_tfm_decoder
+        self.tfm_d_model = tfm_d_model
+        self.tfm_num_layers = tfm_num_layers
+        self.tfm_num_heads = tfm_num_heads
+        self.tfm_mlp_ratio = tfm_mlp_ratio
+        self.tfm_dropout = tfm_dropout
+        self.tfm_attn_dropout = tfm_attn_dropout
+
+        self.positional_embedding = SinusoidalPositionalEmbedding(
+            embedding_dim=input_dim,
+            max_len=sequence_length
+        )
         
         # CNN Encoder layers with dilated convolutions (stride=1, increasing dilation)
         self.encoder_layers = nn.ModuleList()
@@ -70,49 +301,71 @@ class CNNGestureClassifier(nn.Module):
         
         # Layer normalization for latent vector
         self.latent_norm = nn.LayerNorm(latent_dim)
-        
-        # MLP Decoder start - project latent to initial feature map
-        # Calculate initial length for decoder CNN - start small and upsample
-        # We need to calculate the starting size to reach sequence_length after upsampling
-        num_decoder_layers = len(decoder_channels) - 1
-        self.decoder_initial_length = max(1, sequence_length // (2 ** num_decoder_layers))
-        
-        self.latent_to_features = nn.Sequential(
-            nn.Linear(latent_dim, decoder_channels[0]),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(decoder_channels[0], decoder_channels[0] * self.decoder_initial_length)
-        )
-        
-        # CNN Decoder layers (ConvTranspose1d with stride=2, kernel=4)
-        self.decoder_layers = nn.ModuleList()
-        in_channels = decoder_channels[0]
-        
-        for i, out_channels in enumerate(decoder_channels[1:]):
-            self.decoder_layers.append(nn.Sequential(
-                nn.ConvTranspose1d(
-                    in_channels, out_channels, 
-                    kernel_size=4, 
-                    stride=2, 
-                    padding=1,  # (kernel_size - stride) // 2 = (4-2)//2 = 1
-                    output_padding=1  # Ensures exact output size
-                ),
-                nn.BatchNorm1d(out_channels),
+
+        # Initialize decoder based on type
+        if use_tfm_decoder:
+            # Use Transformer-based decoder
+            self.decoder = TFMDecoder(
+                sequence_length=sequence_length,
+                latent_dim=latent_dim,
+                num_classes=num_classes,
+                d_model=tfm_d_model,
+                num_layers=tfm_num_layers,
+                num_heads=tfm_num_heads,
+                mlp_ratio=tfm_mlp_ratio,
+                dropout=tfm_dropout,
+                attn_dropout=tfm_attn_dropout,
+            )
+        else:
+            # Use CNN-based decoder (original implementation)
+            # MLP Decoder start - project latent to initial feature map
+            # Calculate initial length for decoder CNN - start small and upsample
+            # We need to calculate the starting size to reach sequence_length after upsampling
+            num_decoder_layers = len(decoder_channels) - 1
+            self.decoder_initial_length = max(1, sequence_length // (2 ** num_decoder_layers))
+
+            self.latent_to_features = nn.Sequential(
+                nn.Linear(latent_dim, decoder_channels[0]),
                 nn.ReLU(inplace=True),
-                nn.Dropout(dropout)
-            ))
-            in_channels = out_channels
-        
-        # Final refinement layer (no upsampling, just feature processing)
-        self.final_conv = nn.Conv1d(
-            decoder_channels[-1], decoder_channels[-1], 
-            kernel_size=3, stride=1, padding=1
-        )
-        
-        # Classification heads - separate for x and y coordinates
-        # Each outputs [B, num_classes, T] which will be transposed to [B, T, num_classes]
-        self.x_classifier = nn.Conv1d(decoder_channels[-1], num_classes, kernel_size=1)
-        self.y_classifier = nn.Conv1d(decoder_channels[-1], num_classes, kernel_size=1)
+                nn.Dropout(dropout),
+                nn.Linear(decoder_channels[0], decoder_channels[0] * self.decoder_initial_length)
+            )
+
+            # CNN Decoder layers (ConvTranspose1d with stride=2, kernel=4)
+            self.decoder_layers = nn.ModuleList()
+            in_channels = decoder_channels[0]
+
+            for out_channels in decoder_channels[1:]:
+                if out_channels == in_channels:
+                    self.decoder_layers.append(
+                        ResidualUpsampleBlock1D(out_channels, dropout=dropout)
+                    )
+                else:
+                    self.decoder_layers.append(nn.Sequential(
+                        nn.ConvTranspose1d(
+                            in_channels,
+                            out_channels,
+                            kernel_size=4,
+                            stride=2,
+                            padding=1,  # (kernel_size - stride) // 2 = (4-2)//2 = 1
+                            output_padding=1  # Ensures exact output size
+                        ),
+                        nn.BatchNorm1d(out_channels),
+                        nn.ReLU(inplace=True),
+                        nn.Dropout(dropout)
+                    ))
+                in_channels = out_channels
+
+            # Final refinement layer (no upsampling, just feature processing)
+            self.final_conv = nn.Conv1d(
+                decoder_channels[-1], decoder_channels[-1],
+                kernel_size=3, stride=1, padding=1
+            )
+
+            # Classification heads - separate for x and y coordinates
+            # Each outputs [B, num_classes, T] which will be transposed to [B, T, num_classes]
+            self.x_classifier = nn.Conv1d(decoder_channels[-1], num_classes, kernel_size=1)
+            self.y_classifier = nn.Conv1d(decoder_channels[-1], num_classes, kernel_size=1)
         
         self._init_weights()
     
@@ -141,10 +394,15 @@ class CNNGestureClassifier(nn.Module):
             latent: Normalized latent vector [B, latent_dim]
         """
         B, T, C = x.shape
-        
+
+        positional_encoding = self.positional_embedding(
+            T, device=x.device, dtype=x.dtype
+        )
+        x = x + positional_encoding
+
         # Transpose for Conv1d: [B, T, C] -> [B, C, T]
         x = x.transpose(1, 2)  # [B, 2, T]
-        
+
         # Encode through CNN layers
         for layer in self.encoder_layers:
             x = layer(x)
@@ -162,45 +420,55 @@ class CNNGestureClassifier(nn.Module):
     
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode latent vector to classification logits using MLP + CNN upscaling.
-        
+        Decode latent vector to classification logits using either CNN or Transformer decoder.
+
         Args:
             latent: Latent vector [B, latent_dim]
-            
+
         Returns:
             logits: Classification logits [B, T, 2, num_classes]
         """
-        B = latent.shape[0]
-        
-        # Project latent to feature map
-        features = self.latent_to_features(latent)  # [B, channels * initial_length]
-        features = features.view(B, self.decoder_channels[0], self.decoder_initial_length)  # [B, C, L]
-        
-        # Upsample through transposed CNN layers
-        for layer in self.decoder_layers:
-            features = layer(features)
-        
-        # Final refinement
-        features = self.final_conv(features)  # [B, final_channels, current_length]
-        
-        # Ensure exact sequence length match
-        if features.shape[2] != self.sequence_length:
-            features = F.interpolate(
-                features, size=self.sequence_length, 
-                mode='linear', align_corners=False
-            )
-        
-        # Apply classification heads
-        x_logits = self.x_classifier(features)  # [B, num_classes, T]
-        y_logits = self.y_classifier(features)  # [B, num_classes, T]
-        
-        # Transpose to [B, T, num_classes] and stack for [B, T, 2, num_classes]
-        x_logits = x_logits.transpose(1, 2)  # [B, T, num_classes]
-        y_logits = y_logits.transpose(1, 2)  # [B, T, num_classes]
-        
-        logits = torch.stack([x_logits, y_logits], dim=2)  # [B, T, 2, num_classes]
-        
-        return logits
+        if self.use_tfm_decoder:
+            # Use transformer decoder directly
+            return self.decoder(latent)
+        else:
+            # Use CNN decoder (original implementation)
+            B = latent.shape[0]
+
+            # Project latent to feature map
+            features = self.latent_to_features(latent)  # [B, channels * initial_length]
+            features = features.view(B, self.decoder_channels[0], self.decoder_initial_length)  # [B, C, L]
+
+            # Upsample through transposed CNN layers
+            for layer in self.decoder_layers:
+                features = layer(features)
+
+            # Final refinement
+            features = self.final_conv(features)  # [B, final_channels, current_length]
+
+            # Ensure exact sequence length match
+            current_length = features.shape[2]
+            if current_length > self.sequence_length:
+                features = features[:, :, :self.sequence_length]
+            elif current_length < self.sequence_length:
+                features = F.interpolate(
+                    features,
+                    size=self.sequence_length,
+                    mode='linear',
+                    align_corners=False,
+                )
+
+            # Apply classification heads
+            x_logits = self.x_classifier(features)  # [B, num_classes, T]
+            y_logits = self.y_classifier(features)  # [B, num_classes, T]
+
+            # Transpose to [B, T, num_classes] and stack for [B, T, 2, num_classes]
+            x_logits = x_logits.transpose(1, 2)  # [B, T, num_classes]
+            y_logits = y_logits.transpose(1, 2)  # [B, T, num_classes]
+
+            logits = torch.stack([x_logits, y_logits], dim=2)  # [B, T, 2, num_classes]
+
+            return logits
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -662,10 +930,17 @@ def create_model_and_trainer(
     encoder_channels: list = [64, 128, 256, 512],
     decoder_channels: list = [512, 256, 128, 64],
     device: str = 'cuda',
+    use_tfm_decoder: bool = False,
+    tfm_d_model: int = 512,
+    tfm_num_layers: int = 6,
+    tfm_num_heads: int = 8,
+    tfm_mlp_ratio: float = 4.0,
+    tfm_dropout: float = 0.1,
+    tfm_attn_dropout: float = 0.1,
 ) -> Tuple[CNNGestureClassifier, CNNGestureClassifierTrainer, CoordinateQuantizer]:
     """
     Factory function to create CNN model, trainer, and quantizer.
-    
+
     Returns:
         model: CNNGestureClassifier model
         trainer: CNNGestureClassifierTrainer
@@ -679,11 +954,18 @@ def create_model_and_trainer(
         num_classes=num_classes,
         encoder_channels=encoder_channels,
         decoder_channels=decoder_channels,
+        use_tfm_decoder=use_tfm_decoder,
+        tfm_d_model=tfm_d_model,
+        tfm_num_layers=tfm_num_layers,
+        tfm_num_heads=tfm_num_heads,
+        tfm_mlp_ratio=tfm_mlp_ratio,
+        tfm_dropout=tfm_dropout,
+        tfm_attn_dropout=tfm_attn_dropout,
     ).to(device)
-    
+
     quantizer = CoordinateQuantizer(num_classes=num_classes)
     trainer = CNNGestureClassifierTrainer(model, quantizer, device=device)
-    
+
     return model, trainer, quantizer
 
 
@@ -737,54 +1019,81 @@ if __name__ == "__main__":
     # Test the model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    
+
+    # Test TFMDecoder
+    print("\n=== Testing TFMDecoder ===")
+    tfm_decoder = TFMDecoder(
+        sequence_length=250,
+        latent_dim=128,
+        num_classes=3000,
+        d_model=512,
+        num_layers=6,
+        num_heads=8
+    ).to(device)
+
+    # Test forward pass
+    batch_size = 4
+    latent_input = torch.randn(batch_size, 128).to(device)  # [B, latent_dim]
+    tfm_logits = tfm_decoder(latent_input)
+
+    print(f"TFMDecoder parameters: {sum(p.numel() for p in tfm_decoder.parameters()):,}")
+    print(f"Latent input shape: {latent_input.shape}")
+    print(f"TFMDecoder output shape: {tfm_logits.shape}")
+    print(f"Expected output shape: [B={batch_size}, T=250, 2, num_classes=3000]")
+
+    # Verify output shape matches CNN decoder
+    print(f"Shape verification: {tfm_logits.shape == torch.Size([batch_size, 250, 2, 3000])}")
+
     # Create model
+    print("\n=== Testing CNN Gesture Classifier ===")
     model, trainer, quantizer = create_model_and_trainer(
         sequence_length=250,
         latent_dim=128,
         device=device
     )
-    
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
+
+    print(f"CNN Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
     # Test with sample data
-    batch_size = 4
     sample_input = torch.randn(batch_size, 250, 2)  # [B, T, 2]
-    
+
     # Forward pass
     latent, logits = model(sample_input.to(device))
-    
+
     print(f"Input shape: {sample_input.shape}")
     print(f"Latent shape: {latent.shape}")
-    print(f"Logits shape: {logits.shape}")
-    
+    print(f"CNN Logits shape: {logits.shape}")
+
+    # Compare CNN decoder output with TFM decoder output shapes
+    print(f"CNN and TFM decoder output shapes match: {logits.shape == tfm_logits.shape}")
+
     # Test loss computation
     loss, loss_dict = compute_classification_loss(logits, sample_input, quantizer)
     print(f"Loss: {loss.item():.4f}")
     print(f"Loss breakdown: {loss_dict}")
-    
+
     # Test reconstruction
     reconstruction = trainer.reconstruct(sample_input)
     print(f"Reconstruction shape: {reconstruction.shape}")
-    
+
     # Test delta computation
     delta_coords = trainer.compute_delta_predictions(sample_input)
     print(f"Delta coordinates shape: {delta_coords.shape}")
-    
+
     # Test compute_delta_class function directly
     delta_direct = compute_delta_class(logits, quantizer)
     print(f"Direct delta computation shape: {delta_direct.shape}")
-    
+
     # Verify delta computation preserves smoothness
     # Compare delta of original vs delta of reconstructed
     original_delta = sample_input[:, 1:, :2] - sample_input[:, :-1, :2]
     reconstruction_delta = reconstruction[:, 1:, :] - reconstruction[:, :-1, :]
     delta_mse = torch.mean((original_delta - reconstruction_delta) ** 2)
     delta_computed_mse = torch.mean((original_delta - delta_coords) ** 2)
-    
+
     print(f"Original vs reconstruction delta MSE: {delta_mse.item():.6f}")
     print(f"Original vs computed delta MSE: {delta_computed_mse.item():.6f}")
-    
+
     # Recommend architecture for sequence length 250
     arch_rec = recommend_architecture(250)
     print(f"Architecture recommendation: {arch_rec}")

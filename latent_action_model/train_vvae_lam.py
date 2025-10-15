@@ -32,8 +32,8 @@ try:
 except ImportError:
     FVCORE_AVAILABLE = False
 
-from latent_action_model.vae import LatentActionVAE
-from latent_action_model.dataloader import create_dataloaders, LAMDataset
+from latent_action_model.vqvae import VVAELatentActionVQVAE
+from latent_action_model.dataloader_vvae import create_vvae_dataloaders
 
 
 logger = logging.getLogger(__name__)
@@ -49,25 +49,25 @@ def _ddp_mean(x: float, device) -> float:
     return float(t.item())
 
 
-def calculate_model_flops(model, input_shape=(8, 256, 1024), device="cuda"):
+def calculate_model_flops(model, input_shape=(8, 16, 64, 64), device="cuda"):
     """
-    Calculate FLOPs for the LAM VAE model.
-    
+    Calculate FLOPs for the VVAE LAM model.
+
     Args:
-        model: LAM VAE model
-        input_shape: Input tensor shape (T, N, D) for sequence
+        model: VVAE LAM model
+        input_shape: Input tensor shape (T, C, H, W) for VVAE sequence
         device: Device to run calculation on
-    
+
     Returns:
         forward_flops: FLOPs for forward pass
         backward_flops: Approximate FLOPs for backward pass (3x forward)
     """
     model.eval()
-    
+
     # Create dummy input batch
-    T, N, D = input_shape
+    T, C, H, W = input_shape
     B = 1  # Use batch size 1 for FLOP calculation
-    dummy_input = torch.randn(B, T, N, D).to(device)
+    dummy_input = torch.randn(B, T, C, H, W).to(device)
     
     forward_flops = 0
     
@@ -86,10 +86,10 @@ def calculate_model_flops(model, input_shape=(8, 256, 1024), device="cuda"):
         try:
             # Fallback to ptflops
             # ptflops expects input shape without batch dimension
-            input_size = (T, N, D)
+            input_size = (T, C, H, W)  # VVAE format
             macs, params = get_model_complexity_info(
-                model, 
-                input_size, 
+                model,
+                input_size,
                 print_per_layer_stat=False,
                 as_strings=False
             )
@@ -98,33 +98,54 @@ def calculate_model_flops(model, input_shape=(8, 256, 1024), device="cuda"):
         except Exception as e:
             logger.warning(f"ptflops FLOP counting failed: {e}")
             forward_flops = 0
-    
+
     if forward_flops == 0:
         # Manual estimation as fallback
         logger.warning("Using manual FLOP estimation (less accurate)")
-        
+
         # Rough estimation based on transformer architecture
-        embed_dim = model.encoder.embed_dim
-        action_dim = model.action_dim
-        num_patches = N
+        # For VVAE LAM: model.lam has encoder/decoder, not model directly
+        try:
+            embed_dim = model.lam.encoder.embed_dim
+            encoder_blocks = len(model.lam.encoder.blocks)
+            decoder_blocks = len(model.lam.decoder.blocks)
+        except:
+            # Fallback values if structure is different
+            embed_dim = 512
+            encoder_blocks = 3
+            decoder_blocks = 3
+
+        # Get action/code dimension (works for both VAE and VQ-VAE)
+        action_dim = getattr(model, 'codebook_dim', 128) * 3
+
+        # VVAE adapts C=16, H=64, W=64 -> N=256 patches of D=256 dim
+        N = 256  # num_patches after adapter
+        D = 256  # patch_dim after adapter
         seq_len = T
-        
+
+        # Adapter FLOPs (CNN operations)
+        # vvae_to_lam: Conv2d 16->256, output size 16x16
+        adapter_flops = T * 16 * 256 * 16 * 16 * 9  # Conv with 3x3 kernel (approx)
+
         # Encoder FLOPs (approximate)
         encoder_flops = 0
         encoder_flops += T * N * D * embed_dim  # Patch projection
-        encoder_flops += len(model.encoder.blocks) * (T * N) * embed_dim * embed_dim * 4  # Attention + MLP
+        encoder_flops += encoder_blocks * (T * N) * embed_dim * embed_dim * 4  # Attention + MLP
         encoder_flops += embed_dim * action_dim * 2  # Output heads
-        
-        # Decoder FLOPs (approximate) 
+
+        # Decoder FLOPs (approximate)
         decoder_flops = 0
         decoder_flops += action_dim * embed_dim  # Action projection
-        decoder_flops += len(model.decoder.blocks) * N * embed_dim * embed_dim * 4  # Cross-attention + MLP
+        decoder_flops += decoder_blocks * N * embed_dim * embed_dim * 4  # Cross-attention + MLP
         decoder_flops += N * embed_dim * D  # Output projection
-        
-        # Loss computation (approximate)
-        loss_flops = N * D * 2  # L1 loss + KL loss
-        
-        forward_flops = encoder_flops + decoder_flops + loss_flops
+
+        # Reverse adapter FLOPs (CNN operations)
+        reverse_adapter_flops = (T-1) * 256 * 16 * 16 * 16 * 9  # ConvTranspose (approx)
+
+        # Loss computation (approximate) - MSE on VVAE latents
+        loss_flops = (T-1) * C * H * W * 2  # MSE loss + VQ loss
+
+        forward_flops = adapter_flops + encoder_flops + decoder_flops + reverse_adapter_flops + loss_flops
         logger.info(f"FLOPs estimated manually: {forward_flops:,}")
     
     # Backward pass is approximately 2x forward pass
@@ -134,14 +155,14 @@ def calculate_model_flops(model, input_shape=(8, 256, 1024), device="cuda"):
     return forward_flops, backward_flops, total_flops
 
 
-class LAMTrainer:
+class VVAELAMTrainer:
     """
-    Trainer for Latent Action Model VAE with variable context length support.
+    Trainer for VVAE Latent Action Model (VQ-VAE variant).
     """
-    
+
     def __init__(
         self,
-        model: LatentActionVAE,
+        model: VVAELatentActionVQVAE,
         train_loader: DataLoader,
         val_loader: DataLoader,
         test_loader: Optional[DataLoader] = None,
@@ -166,7 +187,8 @@ class LAMTrainer:
         rollout_weight: float = 1.0,
         rollout_prob: float = 1.0,
         detach_rollout_first: bool = True,
-        anchor_strategy: str = "random"
+        anchor_strategy: str = "random",
+        validation_fraction: float = 1.0
     ):
         """
         Args:
@@ -192,8 +214,10 @@ class LAMTrainer:
             rollout_prob: Probability of computing rollout loss (0-1)
             detach_rollout_first: Whether to detach first predicted state before rollout
             anchor_strategy: Rollout anchor strategy ("random" or "last")
+            validation_fraction: Fraction of validation set to evaluate (0-1, default 1.0)
         """
         self.device = device
+        self.validation_fraction = validation_fraction
         self.use_ddp = dist.is_initialized()
         
         if self.use_ddp:
@@ -222,7 +246,8 @@ class LAMTrainer:
         self.max_grad_norm = max_grad_norm
         self.kl_annealing_steps = kl_annealing_steps
         self.kl_min_weight = kl_min_weight
-        self.kl_max_weight = model_for_optim.kl_weight
+        # VQ-VAE doesn't use kl_weight, set to 0
+        self.kl_max_weight = 0.0
 
         # Rollout parameters
         self.rollout_horizon = rollout_horizon
@@ -249,7 +274,7 @@ class LAMTrainer:
         # Mixed precision
         self.mixed_precision = mixed_precision
         if mixed_precision:
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler('cuda')
         
         # Training state
         self.global_step = 0
@@ -257,9 +282,9 @@ class LAMTrainer:
         self.best_val_loss = float('inf')
         self.best_recon_loss = float('inf')  # Track best reconstruction loss
         
-        # Validation frequency (every 5% of training steps per epoch - twice as frequent)
+        # Validation frequency (every half epoch for VQ-VAE)
         self.steps_per_epoch = len(train_loader)
-        self.val_frequency = max(1, self.steps_per_epoch // 20)  # Validate 20 times per epoch
+        self.val_frequency = max(1, self.steps_per_epoch // 2)  # Validate 2 times per epoch (every half epoch)
         
         # Total training steps will be set when training starts
         self.total_training_steps = None
@@ -283,8 +308,7 @@ class LAMTrainer:
                 project=wandb_project,
                 name=run_name,
                 config={
-                    'latent_dim': model_for_optim.latent_dim,
-                    'action_dim': model_for_optim.action_dim,
+                    **model_for_optim.config,  # Include all model config (works for both VAE and VQ-VAE)
                     'learning_rate': learning_rate,
                     'batch_size': train_loader.batch_size,
                     'warmup_steps': warmup_steps,
@@ -308,7 +332,7 @@ class LAMTrainer:
             logger.info("=" * 60)
             logger.info("TEST MODE ACTIVATED: Using only 1 batch for overfitting test")
             logger.info("Test mode defaults:")
-            logger.info("  - KL weight: 0.0 (disabled)")
+            logger.info("  - VQ loss only (no KL divergence)")
             logger.info("  - Dropout: 0.0 (disabled)")
             logger.info("  - Validation: Disabled")
             logger.info("=" * 60)
@@ -335,7 +359,7 @@ class LAMTrainer:
                 module.p = 0.0
         logger.info("Disabled all dropout layers for test mode")
     
-    def _save_model_config(self, model: LatentActionVAE):
+    def _save_model_config(self, model: VVAELatentActionVQVAE):
         """Save model configuration to JSON file."""
         config_path = self.checkpoint_dir / "model_config.json"
         with open(config_path, 'w') as f:
@@ -351,8 +375,8 @@ class LAMTrainer:
         
         # Get typical input shape from the dataloader
         sample_batch = next(iter(self.train_loader))
-        sequence_shape = sample_batch['sequence'].shape  # [B, T, N, D]
-        input_shape = sequence_shape[1:]  # (T, N, D) - remove batch dimension
+        sequence_shape = sample_batch['sequence'].shape  # [B, T, C, H, W]
+        input_shape = sequence_shape[1:]  # (T, C, H, W) - remove batch dimension
         
         try:
             # In DDP, the model is on a specific device, get it from a parameter
@@ -430,28 +454,17 @@ class LAMTrainer:
         # In DDP, self.device is the local rank's device, which is correct
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
-        # DEBUG: Check tensor device
-        # if dist.is_initialized():
-        #     logger.info(f"Rank {dist.get_rank()}: Tensor device in train_step: {batch['sequence'].device}")
-        
-        # Apply layer normalization to input sequences (z-score normalization on D=1024)
-        # This matches the preprocessing used by VJ2 predictor models
-        batch['sequence'] = F.layer_norm(batch['sequence'], (batch['sequence'].size(-1),))
-        if 'next' in batch:
-            batch['next'] = F.layer_norm(batch['next'], (batch['next'].size(-1),))
-        
-        # Note: Additional layer normalization is also applied inside the model after patch_proj
-        # for stability (on embed_dim=512). This double normalization is intentional.
+        # No layer normalization needed for VVAE latents
         
         # Get current KL weight
         kl_weight = self.get_kl_weight()
         
         # Forward pass with mixed precision
         if self.mixed_precision:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 loss_dict = (self.model.module if self.use_ddp else self.model).compute_loss(
                     batch,
-                    beta_schedule=kl_weight,
+                    beta_schedule=1.0,  # Not used in VQ-VAE
                     rollout_horizon=self.rollout_horizon,
                     rollout_weight=self.rollout_weight,
                     rollout_prob=self.rollout_prob,
@@ -462,7 +475,7 @@ class LAMTrainer:
         else:
             loss_dict = (self.model.module if self.use_ddp else self.model).compute_loss(
                 batch,
-                beta_schedule=kl_weight,
+                beta_schedule=1.0,  # Not used in VQ-VAE
                 rollout_horizon=self.rollout_horizon,
                 rollout_weight=self.rollout_weight,
                 rollout_prob=self.rollout_prob,
@@ -497,20 +510,24 @@ class LAMTrainer:
         if hasattr(self, 'tflops_per_step') and self.tflops_per_step > 0:
             self.total_tflops += self.tflops_per_step
         
-        # Return metrics
+        # Return metrics with clear naming
         metrics = {
-            'loss': loss.item(),
-            'recon_loss': loss_dict['recon_loss'].item(),
-            'kl_loss': loss_dict['kl_loss'].item(),
-            'rollout_loss': loss_dict['rollout_loss'].item(),
+            'loss': loss.item(),                                        # Total loss (MSE-based, used for optimization)
+            'loss_mae': loss_dict['loss_mae'].item(),                   # Total loss (MAE-based, monitoring)
+            'recon_loss': loss_dict['recon_loss'].item(),               # Reconstruction MSE
+            'mse_loss': loss_dict['mse_loss'].item(),                   # MSE (same as recon_loss)
+            'mae_loss': loss_dict['mae_loss'].item(),                   # MAE (monitoring)
+            'vq_loss': loss_dict['vq_loss'].item(),                     # VQ loss
+            'codebook_loss': loss_dict['codebook_loss'].item(),         # Codebook loss component
+            'commitment_loss': loss_dict['commitment_loss'].item(),     # Commitment loss component
+            'rollout_loss': loss_dict['rollout_loss'].item(),           # Rollout MSE
+            'rollout_loss_mae': loss_dict['rollout_loss_mae'].item(),   # Rollout MAE (monitoring)
             'kl_weight': kl_weight,
             'lr': self.get_lr(),
-            'total_tflops': self.total_tflops  # Include cumulative TFLOPs
+            'total_tflops': self.total_tflops,
+            'codebook_usage': loss_dict.get('codebook_usage', 0),
+            'indices': loss_dict.get('indices', None)
         }
-
-        # Add MSE loss if available
-        if 'mse_loss' in loss_dict:
-            metrics['mse_loss'] = loss_dict['mse_loss'].item()
 
         return metrics
     
@@ -521,15 +538,8 @@ class LAMTrainer:
         
         # Move batch to device
         batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
-        
-        # Apply layer normalization to input sequences (z-score normalization on D=1024)
-        # This matches the preprocessing used by VJ2 predictor models
-        batch['sequence'] = F.layer_norm(batch['sequence'], (batch['sequence'].size(-1),))
-        if 'next' in batch:
-            batch['next'] = F.layer_norm(batch['next'], (batch['next'].size(-1),))
-        
-        # Note: Additional layer normalization is also applied inside the model after patch_proj
-        # for stability (on embed_dim=512). This double normalization is intentional.
+
+        # No layer normalization needed for VVAE latents
         
         # Forward pass for standard losses with rollout parameters
         loss_dict = (self.model.module if self.use_ddp else self.model).compute_loss(
@@ -541,42 +551,51 @@ class LAMTrainer:
             anchor_strategy=self.anchor_strategy
         )
         
-        # Action sensitivity check
-        z_sequence = batch['sequence']  # [B, T, N, D]
-        B, T, N, D = z_sequence.shape
-        z_past = z_sequence[:, :-1, :, :]  # [B, T-1, N, D]
-        z_target = z_sequence[:, -1, :, :]  # [B, N, D]
-        
-        # Get true action latents from encoder (now per-transition)
+        # Action sensitivity check for VVAE format
+        z_sequence = batch['sequence']  # [B, T, C=16, H=64, W=64]
+        B, T, C, H, W = z_sequence.shape
+        z_target = z_sequence[:, -1]  # [B, C, H, W] - target is the last frame
+
+        # Get true action codes from encoder
         model_ref = self.model.module if self.use_ddp else self.model
-        mu, logvar = model_ref.encode(z_sequence)  # [B, T-1, A]
-        a_true_seq = model_ref.reparameterize(mu, logvar)  # [B, T-1, A]
-        
-        # For eval, we want the action for the final transition (z_{T-1} -> z_T)
-        a_true = a_true_seq[:, -1, :]  # [B, A] - last action in sequence
-        
-        # Generate random action latent from prior N(0, I)
-        a_rand = torch.randn_like(a_true)  # [B, A]
-        
-        # Generate slightly perturbed action for DSNR calculation
-        epsilon = 0.01  # Small perturbation
-        a_perturbed = a_true + epsilon * torch.randn_like(a_true)  # [B, A]
-        
-        # Decode with true action
-        z_pred_true = model_ref.decode(z_past, a_true)  # [B, N, D]
-        
-        # Decode with random action
-        z_pred_rand = model_ref.decode(z_past, a_rand)  # [B, N, D]
-        
-        # Decode with perturbed action
-        z_pred_perturbed = model_ref.decode(z_past, a_perturbed)  # [B, N, D]
-        
-        # Compute distances (L2 norm in patch space)
-        # Flatten patches for distance computation: [B, N*D]
-        z_target_flat = z_target.view(B, -1)
-        z_pred_true_flat = z_pred_true.view(B, -1)
-        z_pred_rand_flat = z_pred_rand.view(B, -1)
-        z_pred_perturbed_flat = z_pred_perturbed.view(B, -1)
+        mu, logvar = model_ref.encode(z_sequence)  # [B, T-1, 3*codebook_dim]
+        z_e = model_ref.lam.reparameterize(mu, logvar)  # [B, T-1, 3*codebook_dim]
+        z_q, indices, _, _, _ = model_ref.lam.quantize(z_e)  # z_q: [B, T-1, 3, codebook_dim]
+
+        # For decoding the final frame, we need all T-1 past frames (z_0 to z_{T-2})
+        # and all T-1 code embeddings (for transitions 0->1, 1->2, ..., T-2->T-1)
+        z_past = z_sequence[:, :-1]  # [B, T-1, C, H, W] - frames 0 to T-2
+        codes_past = z_q  # [B, T-1, 3, codebook_dim]
+
+        # Generate random code indices for comparison
+        rand_indices = torch.randint(0, model_ref.lam.num_embeddings, (B, T-1, 3), device=z_sequence.device)
+        codes_rand = model_ref.lam.codebook(rand_indices)  # [B, T-1, 3, codebook_dim]
+
+        # Generate perturbed codes (flip one random code per sequence)
+        codes_perturbed = codes_past.clone()
+        for i in range(B):
+            # Randomly select which code to flip (out of T-1 transitions * 3 codes each)
+            flip_idx = torch.randint(0, (T-1) * 3, (1,)).item()
+            t_idx = flip_idx // 3
+            code_idx = flip_idx % 3
+            new_code_idx = torch.randint(0, model_ref.lam.num_embeddings, (1,), device=z_sequence.device)
+            codes_perturbed[i, t_idx, code_idx] = model_ref.lam.codebook(new_code_idx).squeeze(0)
+
+        # Decode with true codes - note: decode expects [B, T-1, C, H, W] and returns [B, C, H, W]
+        z_pred_true = model_ref.decode(z_past, codes_past)  # [B, C, H, W]
+
+        # Decode with random codes
+        z_pred_rand = model_ref.decode(z_past, codes_rand)  # [B, C, H, W]
+
+        # Decode with perturbed codes
+        z_pred_perturbed = model_ref.decode(z_past, codes_perturbed)  # [B, C, H, W]
+
+        # Compute distances (L2 norm in VVAE latent space)
+        # Flatten VVAE latents for distance computation: [B, C*H*W]
+        z_target_flat = z_target.reshape(B, -1)
+        z_pred_true_flat = z_pred_true.reshape(B, -1)
+        z_pred_rand_flat = z_pred_rand.reshape(B, -1)
+        z_pred_perturbed_flat = z_pred_perturbed.reshape(B, -1)
         
         # L2 distances
         d_action = torch.norm(z_pred_true_flat - z_target_flat, dim=1)  # [B] (renamed from d_true)
@@ -588,7 +607,7 @@ class LAMTrainer:
         d_rand_l1 = torch.norm(z_pred_rand_flat - z_target_flat, p=1, dim=1)  # [B]
         
         # MAE (Mean Absolute Error) - averaged over all dimensions
-        num_elements = z_pred_true_flat.shape[1]  # N*D
+        num_elements = z_pred_true_flat.shape[1]  # C*H*W for VVAE
         d_action_mae = torch.abs(z_pred_true_flat - z_target_flat).sum(dim=1) / num_elements  # [B]
         d_rand_mae = torch.abs(z_pred_rand_flat - z_target_flat).sum(dim=1) / num_elements  # [B]
         
@@ -613,64 +632,90 @@ class LAMTrainer:
         d_cos_action = 1 - cos_sim_true  # [B]
         d_cos_rand = 1 - cos_sim_rand  # [B]
         action_sensitivity_cos = (d_cos_rand - d_cos_action).mean().item()
-        
+
+        # Get codebook usage and indices for histogram
+        codebook_usage = loss_dict.get('codebook_usage', 0)
+        indices = loss_dict.get('indices', None)  # [B, T-1, 3]
+
         return {
-            'loss': loss_dict['loss'].item(),
-            'recon_loss': loss_dict['recon_loss'].item(),
-            'mse_loss': loss_dict['mse_loss'].item(),
-            'kl_loss': loss_dict['kl_loss'].item(),
-            'rollout_loss': loss_dict['rollout_loss'].item(),
-            'action_sensitivity_l2': action_sensitivity,
-            'action_sensitivity_l1': action_sensitivity_l1,
-            'action_sensitivity_mae': action_sensitivity_mae,
-            'action_sensitivity_cos': action_sensitivity_cos,
-            'dsnr': dsnr_mean,
-            'd_action_l2': d_action.mean().item(),
-            'd_rand_l2': d_rand.mean().item(),
-            'd_action_eps_l2': d_action_eps.mean().item(),
-            'd_action_l1': d_action_l1.mean().item(),
-            'd_rand_l1': d_rand_l1.mean().item(),
-            'd_action_mae': d_action_mae.mean().item(),
-            'd_rand_mae': d_rand_mae.mean().item(),
-            'total_tflops': self.total_tflops  # Include cumulative TFLOPs
+            'loss': loss_dict['loss'].item(),                           # Total loss (MSE-based)
+            'loss_mae': loss_dict['loss_mae'].item(),                   # Total loss (MAE-based, monitoring)
+            'recon_loss': loss_dict['recon_loss'].item(),               # Reconstruction MSE
+            'mse_loss': loss_dict['mse_loss'].item(),                   # MSE (same as recon_loss)
+            'mae_loss': loss_dict['mae_loss'].item(),                   # MAE (monitoring)
+            'vq_loss': loss_dict['vq_loss'].item(),                     # VQ loss
+            'codebook_loss': loss_dict['codebook_loss'].item(),         # Codebook loss component
+            'commitment_loss': loss_dict['commitment_loss'].item(),     # Commitment loss component
+            'rollout_loss': loss_dict['rollout_loss'].item(),           # Rollout MSE
+            'rollout_loss_mae': loss_dict['rollout_loss_mae'].item(),   # Rollout MAE (monitoring)
+            'action_sensitivity_l2': action_sensitivity,                # Action sensitivity (L2 distance)
+            'action_sensitivity_l1': action_sensitivity_l1,             # Action sensitivity (L1 distance)
+            'action_sensitivity_mae': action_sensitivity_mae,           # Action sensitivity (MAE)
+            'action_sensitivity_cos': action_sensitivity_cos,           # Action sensitivity (cosine)
+            'dsnr': dsnr_mean,                                          # Decoder Signal-to-Noise Ratio
+            'd_action_l2': d_action.mean().item(),                      # L2 distance with true actions
+            'd_rand_l2': d_rand.mean().item(),                          # L2 distance with random actions
+            'd_action_eps_l2': d_action_eps.mean().item(),              # L2 distance with perturbed actions
+            'd_action_l1': d_action_l1.mean().item(),                   # L1 distance with true actions
+            'd_rand_l1': d_rand_l1.mean().item(),                       # L1 distance with random actions
+            'd_action_mae': d_action_mae.mean().item(),                 # MAE with true actions
+            'd_rand_mae': d_rand_mae.mean().item(),                     # MAE with random actions
+            'codebook_usage': codebook_usage,                           # Unique codes used
+            'indices': indices,                                         # Codebook indices for histogram
+            'total_tflops': self.total_tflops                           # Cumulative TFLOPs
         }
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
         self.model.train()
-        
+
         epoch_metrics = {}
-        
+        all_train_indices = []  # Collect indices for histogram in test/overfit mode
+
         if self.test_mode:
             # Test mode: use only the fixed batch multiple times
             num_steps = 100  # Fixed number of steps per epoch in test mode
             logger.info(f"Test mode: Running {num_steps} steps with the same batch")
-            
+
             progress_bar = tqdm(range(num_steps), desc=f"Test Epoch {self.epoch} (Fixed Batch)")
-            
+
             for step in progress_bar:
                 metrics = self.train_step(self.fixed_batch)
-                
-                # Update epoch metrics
+
+                # Collect indices for histogram
+                if 'indices' in metrics and metrics['indices'] is not None:
+                    all_train_indices.append(metrics['indices'].cpu())
+
+                # Update epoch metrics (skip non-numeric keys)
                 for key, value in metrics.items():
+                    if key == 'indices':  # Skip indices
+                        continue
                     if key not in epoch_metrics:
                         epoch_metrics[key] = 0.0
                     epoch_metrics[key] += value
-                
+
                 # Update progress bar
                 if step % 10 == 0:
                     postfix = {
                         'loss': f"{metrics['loss']:.4f}",
                         'recon': f"{metrics['recon_loss']:.4f}",
-                        'kl': f"{metrics['kl_loss']:.4f}",
-                        'rollout': f"{metrics['rollout_loss']:.4f}",
-                        'kl_w': f"{metrics['kl_weight']:.3f}"
+                        'vq': f"{metrics['vq_loss']:.4f}",
+                        'rollout': f"{metrics['rollout_loss']:.4f}"
                     }
+                    if 'codebook_usage' in metrics:
+                        postfix['cb_usage'] = f"{int(metrics['codebook_usage'])}"
                     progress_bar.set_postfix(postfix)
-                
+
                 # Log to wandb more frequently in test mode
                 if self.global_step % 5 == 0 and self.use_wandb:
-                    wandb.log({f'train_test/{k}': v for k, v in metrics.items()}, step=self.global_step)
+                    log_dict = {f'train_test/{k}': v for k, v in metrics.items() if k != 'indices'}
+                    # Add histogram every 20 steps
+                    if step % 20 == 0 and all_train_indices:
+                        indices_tensor = torch.cat(all_train_indices[-5:], dim=0)  # Last 5 batches
+                        indices_flat = indices_tensor.flatten().numpy()
+                        model_ref = self.model.module if self.use_ddp else self.model
+                        log_dict['train_test/codebook_histogram'] = wandb.Histogram(indices_flat, num_bins=model_ref.num_embeddings)
+                    wandb.log(log_dict, step=self.global_step)
             
             # Average metrics
             for key in epoch_metrics:
@@ -697,9 +742,8 @@ class LAMTrainer:
                     postfix = {
                         'loss': f"{metrics['loss']:.4f}",
                         'recon': f"{metrics['recon_loss']:.4f}",
-                        'kl': f"{metrics['kl_loss']:.4f}",
-                        'rollout': f"{metrics['rollout_loss']:.4f}",
-                        'kl_w': f"{metrics['kl_weight']:.3f}"
+                        'vq': f"{metrics['vq_loss']:.4f}",
+                        'rollout': f"{metrics['rollout_loss']:.4f}"
                     }
                     if 'mse_loss' in metrics:
                         postfix['mse'] = f"{metrics['mse_loss']:.4f}"
@@ -707,19 +751,27 @@ class LAMTrainer:
                 
                 # Log to wandb (rank 0 only)
                 if self.global_step % 20 == 0 and self.use_wandb and (not self.use_ddp or dist.get_rank() == 0):
-                    wandb.log({f'train/{k}': v for k, v in metrics.items()}, step=self.global_step)
-                    
+                    # Filter out non-scalar metrics (indices)
+                    scalar_metrics = {k: v for k, v in metrics.items() if k != 'indices'}
+                    wandb.log({f'train/{k}': v for k, v in scalar_metrics.items()}, step=self.global_step)
+
                     # Also log training loss vs TFLOPs for plotting
                     if 'total_tflops' in metrics and metrics['total_tflops'] > 0:
                         wandb.log({
-                            'tflops/train_loss': metrics['loss'],
-                            'tflops/train_recon_loss': metrics['recon_loss'],
-                            'tflops/train_kl_loss': metrics['kl_loss'],
-                            'tflops/train_rollout_loss': metrics['rollout_loss'],
+                            # MSE-based metrics (used for optimization)
+                            'tflops/train_loss_mse': metrics['loss'],
+                            'tflops/train_recon_mse': metrics['recon_loss'],
+                            'tflops/train_rollout_mse': metrics['rollout_loss'],
+                            # MAE-based metrics (monitoring)
+                            'tflops/train_loss_mae': metrics['loss_mae'],
+                            'tflops/train_recon_mae': metrics['mae_loss'],
+                            'tflops/train_rollout_mae': metrics['rollout_loss_mae'],
+                            # Shared metrics
+                            'tflops/train_vq_loss': metrics['vq_loss'],
                             'tflops/x_axis': metrics['total_tflops']
                         }, step=self.global_step)
                 
-                # Validation at 10% intervals (skip in test mode)
+                # Validation every half epoch (skip in test mode)
                 if not self.test_mode and self.global_step % self.val_frequency == 0 and self.global_step > 0:
                     val_metrics = self.evaluate(self.val_loader, "val")
                     logger.info(f"Step {self.global_step} - Val metrics: {val_metrics}")
@@ -735,77 +787,158 @@ class LAMTrainer:
     
     @torch.no_grad()
     def evaluate(self, loader: DataLoader, split: str = "val") -> Dict[str, float]:
-        """Evaluate on a dataset."""
+        """Evaluate on a dataset or a random subset of it."""
         self.model.eval()
-        
+
         epoch_metrics = {}
+        all_indices = []  # Collect all codebook indices for histogram
         num_batches = len(loader)
-        update_frequency = max(1, num_batches // 10)  # Update progress 10 times during evaluation
-        
-        progress_bar = tqdm(loader, desc=f"Evaluating {split}")
-        
-        for batch_idx, batch in enumerate(progress_bar):
+
+        # Determine which batches to evaluate
+        if self.validation_fraction < 1.0:
+            num_batches_to_eval = max(1, int(num_batches * self.validation_fraction))
+            logger.info(f"Evaluating {num_batches_to_eval}/{num_batches} batches ({self.validation_fraction*100:.0f}%) from {split}")
+
+            # Create a subset of indices to sample
+            dataset_size = len(loader.dataset)
+            samples_to_eval = max(1, int(dataset_size * self.validation_fraction))
+
+            # Randomly sample dataset indices (not batch indices)
+            sampled_indices = np.random.choice(dataset_size, samples_to_eval, replace=False)
+
+            # Create new dataloader with subset sampler
+            from torch.utils.data import SubsetRandomSampler
+            subset_sampler = SubsetRandomSampler(sampled_indices)
+
+            subset_loader = DataLoader(
+                loader.dataset,
+                batch_size=loader.batch_size,
+                sampler=subset_sampler,
+                num_workers=0,  # Use 0 workers for subset to avoid deadlock
+                pin_memory=loader.pin_memory
+            )
+
+            actual_loader = subset_loader
+            num_batches_to_eval = len(subset_loader)
+        else:
+            actual_loader = loader
+            num_batches_to_eval = num_batches
+
+        update_frequency = max(1, num_batches_to_eval // 10)  # Update progress 10 times during evaluation
+
+        # Create manual progress bar
+        progress_bar = tqdm(total=num_batches_to_eval, desc=f"Evaluating {split} ({num_batches_to_eval} batches)")
+
+        evaluated_count = 0
+        for batch_idx, batch in enumerate(actual_loader):
+            evaluated_count += 1
             metrics = self.eval_step(batch)
-            
-            # Update epoch metrics (initialize keys dynamically)
+
+            # Collect codebook indices for histogram
+            if 'indices' in metrics and metrics['indices'] is not None:
+                all_indices.append(metrics['indices'].cpu())
+
+            # Update epoch metrics (initialize keys dynamically, skip non-numeric keys)
             for key, value in metrics.items():
+                if key == 'indices':  # Skip indices, we're collecting them separately
+                    continue
                 if key not in epoch_metrics:
                     epoch_metrics[key] = 0.0
                 epoch_metrics[key] += value
-            
+
             # Update progress bar only periodically to reduce lag
-            if batch_idx % update_frequency == 0 or batch_idx == num_batches - 1:
+            if evaluated_count % update_frequency == 0 or evaluated_count == num_batches_to_eval:
                 postfix = {
                     'loss': f"{metrics['loss']:.4f}",
                     'recon': f"{metrics['recon_loss']:.4f}",
-                    'kl': f"{metrics['kl_loss']:.4f}",
+                    'vq': f"{metrics['vq_loss']:.4f}",
                     'rollout': f"{metrics['rollout_loss']:.4f}"
                 }
                 if 'mse_loss' in metrics:
                     postfix['mse'] = f"{metrics['mse_loss']:.4f}"
                 if 'action_sensitivity_l2' in metrics:
                     postfix['act_sens'] = f"{metrics['action_sensitivity_l2']:.3f}"
+                if 'codebook_usage' in metrics:
+                    postfix['cb_usage'] = f"{int(metrics['codebook_usage'])}"
                 progress_bar.set_postfix(postfix)
-        
-        # Average metrics
-        num_batches = len(loader)
+
+            progress_bar.update(1)
+
+        progress_bar.close()
+
+        # Average metrics over the number of batches actually evaluated
         for key in epoch_metrics:
-            epoch_metrics[key] /= num_batches
+            epoch_metrics[key] /= evaluated_count
             
         # Average across DDP ranks
         if self.use_ddp:
             for key in epoch_metrics:
                 epoch_metrics[key] = _ddp_mean(epoch_metrics[key], self.device)
-        
+
+        # Create codebook histogram and compute total unique codes if we have indices
+        codebook_histogram = None
+        if all_indices and self.use_wandb and (not self.use_ddp or dist.get_rank() == 0):
+            # Concatenate all indices: [total_batches*B, T-1, 3]
+            all_indices_tensor = torch.cat(all_indices, dim=0)  # [N, T-1, 3]
+            # Flatten to get all code usage: [N*(T-1)*3]
+            indices_flat = all_indices_tensor.flatten().numpy()
+
+            # Get codebook size from model
+            model_ref = self.model.module if self.use_ddp else self.model
+            codebook_size = model_ref.num_embeddings
+
+            # Compute total unique codes used across entire validation run
+            total_unique_codes = len(np.unique(indices_flat))
+            epoch_metrics['codebook_unique_total'] = total_unique_codes
+            epoch_metrics['codebook_usage_ratio'] = total_unique_codes / codebook_size
+
+            # Create histogram
+            codebook_histogram = wandb.Histogram(indices_flat, num_bins=codebook_size)
+
         # Log to wandb with TFLOP tracking for plots (rank 0 only)
         if self.use_wandb and (not self.use_ddp or dist.get_rank() == 0):
             log_dict = {f'{split}/{k}': v for k, v in epoch_metrics.items()}
+
+            # Add codebook histogram
+            if codebook_histogram is not None:
+                log_dict[f'{split}/codebook_histogram'] = codebook_histogram
             
             # Add TFLOP-indexed metrics for validation to create plots with TFLOPs on x-axis
             if split == 'val' and 'total_tflops' in epoch_metrics:
                 total_tflops = epoch_metrics['total_tflops']
-                val_loss = epoch_metrics['loss']
-                recon_loss = epoch_metrics['recon_loss']
-                kl_loss = epoch_metrics['kl_loss']
+                # MSE-based metrics
+                val_loss_mse = epoch_metrics['loss']
+                recon_mse = epoch_metrics['recon_loss']
+                rollout_mse = epoch_metrics.get('rollout_loss', 0.0)
+                # MAE-based metrics
+                val_loss_mae = epoch_metrics.get('loss_mae', 0.0)
+                recon_mae = epoch_metrics.get('mae_loss', 0.0)
+                rollout_mae = epoch_metrics.get('rollout_loss_mae', 0.0)
+                # Shared metrics
+                vq_loss = epoch_metrics['vq_loss']
                 dsnr = epoch_metrics.get('dsnr', 0.0)
-                
+
                 # Log metrics with TFLOPs as x-axis (using custom x-axis in wandb)
                 # These will create plots with TFLOPs on x-axis when viewed in WandB
                 if total_tflops > 0:
-                    # Primary metrics vs TFLOPs
-                    rollout_loss = epoch_metrics.get('rollout_loss', 0.0)
                     wandb.log({
-                        'tflops/val_loss': val_loss,
-                        'tflops/val_recon_loss': recon_loss,
-                        'tflops/val_kl_loss': kl_loss,
-                        'tflops/val_rollout_loss': rollout_loss,
+                        # MSE-based metrics (used for optimization)
+                        'tflops/val_loss_mse': val_loss_mse,
+                        'tflops/val_recon_mse': recon_mse,
+                        'tflops/val_rollout_mse': rollout_mse,
+                        # MAE-based metrics (monitoring)
+                        'tflops/val_loss_mae': val_loss_mae,
+                        'tflops/val_recon_mae': recon_mae,
+                        'tflops/val_rollout_mae': rollout_mae,
+                        # Shared metrics
+                        'tflops/val_vq_loss': vq_loss,
                         'tflops/val_dsnr': dsnr,
                         'tflops/x_axis': total_tflops  # This serves as the x-axis value
                     }, step=self.global_step)
-                    
-                    # Efficiency metrics
-                    log_dict[f'{split}/loss_per_tflop'] = val_loss / total_tflops
-                    log_dict[f'{split}/recon_per_tflop'] = recon_loss / total_tflops
+
+                    # Efficiency metrics (using MSE-based loss)
+                    log_dict[f'{split}/loss_per_tflop'] = val_loss_mse / total_tflops
+                    log_dict[f'{split}/recon_per_tflop'] = recon_mse / total_tflops
             
             wandb.log(log_dict, step=self.global_step)
         
@@ -842,11 +975,7 @@ class LAMTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'scaler': self.scaler.state_dict() if self.mixed_precision else None,
-            'config': {
-                'latent_dim': model_for_save.latent_dim,
-                'action_dim': model_for_save.action_dim,
-                'kl_weight': model_for_save.kl_weight
-            }
+            'config': model_for_save.config  # Use model's config dict (works for both VAE and VQ-VAE)
         }
         
         # Save based on checkpoint type
@@ -935,12 +1064,15 @@ class LAMTrainer:
                 # Enhanced logging for test mode - check if model is overfitting
                 logger.info("=" * 50)
                 logger.info(f"TEST MODE - Epoch {epoch} Results:")
-                logger.info(f"  Total Loss:    {train_metrics['loss']:.6f}")
-                logger.info(f"  Recon Loss:    {train_metrics['recon_loss']:.6f}")
-                logger.info(f"  KL Loss:       {train_metrics['kl_loss']:.6f}")
-                logger.info(f"  MSE Loss:      {train_metrics.get('mse_loss', 'N/A')}")
-                logger.info(f"  KL Weight:     {train_metrics['kl_weight']:.4f}")
-                logger.info(f"  Learning Rate: {train_metrics['lr']:.6f}")
+                logger.info(f"  Total Loss (MSE):     {train_metrics['loss']:.6f}")
+                logger.info(f"  Total Loss (MAE):     {train_metrics['loss_mae']:.6f}")
+                logger.info(f"  Recon MSE:            {train_metrics['mse_loss']:.6f}")
+                logger.info(f"  Recon MAE:            {train_metrics['mae_loss']:.6f}")
+                logger.info(f"  VQ Loss:              {train_metrics['vq_loss']:.6f}")
+                logger.info(f"  Rollout MSE:          {train_metrics['rollout_loss']:.6f}")
+                logger.info(f"  Rollout MAE:          {train_metrics['rollout_loss_mae']:.6f}")
+                logger.info(f"  Codebook Usage:       {train_metrics.get('codebook_usage', 'N/A')}")
+                logger.info(f"  Learning Rate:        {train_metrics['lr']:.6f}")
                 
                 # Check if loss is decreasing (good sign)
                 if epoch > 0 and hasattr(self, 'prev_loss'):
@@ -958,23 +1090,25 @@ class LAMTrainer:
                 if epoch == 0 and self.global_step >= 10:  # After 10 steps
                     logger.info("\n=== Gradient Sanity Check ===")
                     no_grad_params = []
-                    for n, p in self.model.decoder.named_parameters():
+                    # For VVAE LAM, decoder is at model.lam.decoder
+                    decoder = self.model.lam.decoder if hasattr(self.model, 'lam') else self.model.decoder
+                    for n, p in decoder.named_parameters():
                         if p.grad is None:
                             no_grad_params.append(n)
                         elif p.grad.norm().item() < 1e-8:
                             logger.info(f"  ⚠️  Very small gradient: {n} (norm={p.grad.norm().item():.2e})")
-                    
+
                     if no_grad_params:
                         logger.warning("  ⚠️  Parameters with NO gradients:")
                         for n in no_grad_params:
                             logger.warning(f"    - {n}")
                     else:
                         logger.info("  ✅ All decoder parameters have gradients!")
-                    
+
                     # Check key components
                     key_params = ['query_embed', 'cross_attn', 'output_proj']
                     for key in key_params:
-                        has_grad = any(key in n for n, p in self.model.decoder.named_parameters() if p.grad is not None and p.grad.norm().item() > 1e-8)
+                        has_grad = any(key in n for n, p in decoder.named_parameters() if p.grad is not None and p.grad.norm().item() > 1e-8)
                         if has_grad:
                             logger.info(f"  ✅ {key} components have gradients")
                         else:
@@ -1022,55 +1156,31 @@ def train_with_variable_context(
     manifest_path: str,
     num_epochs: int = 100,
     batch_size: int = 32,
-    min_context_length: int = 4,
-    max_context_length: int = 20,
-    context_schedule: str = "linear",
+    context_length: int = 20,
     device: str = "cuda",
     is_ddp: bool = False,
     **kwargs
 ):
     """
-    Train LAM with variable context length curriculum.
-    
+    Train LAM with fixed context length.
+    Causal masking handles variable-length contexts automatically.
+
     Args:
         data_dir: Path to dataset directory
         manifest_path: Path to manifest file
         num_epochs: Total number of epochs
         batch_size: Batch size
-        min_context_length: Minimum context length to start with
-        max_context_length: Maximum context length to reach
-        context_schedule: How to increase context ("linear", "exponential", "step")
+        context_length: Fixed context length (model uses causal masking for variable lengths)
         device: Device to train on
         is_ddp: Whether distributed training is enabled
         **kwargs: Additional arguments for model and trainer
+            resume_from: Path to checkpoint to resume from (optional)
     """
-    
-    def get_context_length(epoch: int) -> int:
-        """Get context length for current epoch based on schedule."""
-        progress = epoch / num_epochs
-        
-        if context_schedule == "linear":
-            # Linear increase
-            length = min_context_length + (max_context_length - min_context_length) * progress
-        elif context_schedule == "exponential":
-            # Exponential increase
-            length = min_context_length * ((max_context_length / min_context_length) ** progress)
-        elif context_schedule == "step":
-            # Step increase every 25% of training
-            steps = [0.25, 0.5, 0.75, 1.0]
-            for step in steps:
-                if progress <= step:
-                    length = min_context_length + (max_context_length - min_context_length) * step
-                    break
-        else:
-            length = max_context_length
-        
-        return int(length)
-    
-    # Initialize model with patch-based architecture
-    model = LatentActionVAE(
-        latent_dim=kwargs.get('latent_dim', 1024),  # D = patch dimension = 1024
-        action_dim=kwargs.get('action_dim', 128),
+
+    # Initialize VVAE VQ-VAE model with adapters
+    model = VVAELatentActionVQVAE(
+        codebook_dim=kwargs.get('codebook_dim', 128),
+        num_embeddings=kwargs.get('num_embeddings', 12),
         embed_dim=kwargs.get('embed_dim', 512),
         encoder_depth=kwargs.get('encoder_depth', 3),
         decoder_depth=kwargs.get('decoder_depth', 3),
@@ -1079,23 +1189,23 @@ def train_with_variable_context(
         mlp_ratio=kwargs.get('mlp_ratio', 4.0),
         drop_rate=kwargs.get('drop_rate', 0.0),
         attn_drop_rate=kwargs.get('attn_drop_rate', 0.0),
-        kl_weight=kwargs.get('kl_weight', 0.1)
+        commitment_weight=kwargs.get('commitment_weight', 0.25),
+        reconstruction_weight=kwargs.get('reconstruction_weight', 1.0),
+        max_seq_len=context_length
     )
-    
-    # Create initial dataloaders with minimum context length
-    current_context = min_context_length
-    (train_loader, val_loader, test_loader), (train_sampler, val_sampler, test_sampler) = create_dataloaders(
+
+    # Create dataloaders with fixed context length
+    train_loader, val_loader, test_loader = create_vvae_dataloaders(
         data_dir=data_dir,
         manifest_path=manifest_path,
         batch_size=batch_size,
-        sequence_length=current_context,
+        sequence_length=context_length,
         num_workers=kwargs.get('num_workers', 8),
-        return_samplers=True,
         ddp=is_ddp
     )
     
     # Initialize trainer
-    trainer = LAMTrainer(
+    trainer = VVAELAMTrainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1111,69 +1221,65 @@ def train_with_variable_context(
         rollout_weight=kwargs.get('rollout_weight', 1.0),
         rollout_prob=kwargs.get('rollout_prob', 1.0),
         detach_rollout_first=kwargs.get('detach_rollout_first', True),
-        anchor_strategy=kwargs.get('anchor_strategy', 'random')
+        anchor_strategy=kwargs.get('anchor_strategy', 'random'),
+        validation_fraction=kwargs.get('validation_fraction', 1.0),
+        use_wandb=kwargs.get('use_wandb', False),
+        wandb_project=kwargs.get('project_name', 'vvae-lam'),
+        wandb_run_name=kwargs.get('run_name', None)
     )
-    
-    # Initial validation run to establish baseline (skip in test mode)
-    if not kwargs.get('test_mode', False):
+
+    # Load checkpoint if resuming
+    resume_from = kwargs.get('resume_from', None)
+    if resume_from is not None:
+        logger.info(f"Resuming training from checkpoint: {resume_from}")
+        trainer.load_checkpoint(resume_from)
+        logger.info(f"Resumed from epoch {trainer.epoch}, step {trainer.global_step}")
+
+    # Initial validation run to establish baseline (skip in test mode or when resuming)
+    if not kwargs.get('test_mode', False) and resume_from is None:
         logger.info("Running initial validation...")
         initial_val_metrics = trainer.evaluate(trainer.val_loader, "val")
         logger.info(f"Initial validation metrics: {initial_val_metrics}")
+    elif resume_from is not None:
+        logger.info("Resuming from checkpoint: Skipping initial validation")
     else:
         logger.info("Test mode: Skipping initial validation")
     
-    # Set total training steps for KL annealing (reaches max at final epoch)  
+    # Set total training steps for KL annealing (reaches max at final epoch)
     trainer.total_training_steps = num_epochs * len(train_loader)
     logger.info(f"KL weight will reach max ({trainer.kl_max_weight}) at step {trainer.total_training_steps}")
-    
+
     # Initialize FLOP tracking for compute efficiency analysis
     trainer._initialize_flop_tracking()
-    
-    # Training loop with curriculum
-    for epoch in range(num_epochs):
-        # Skip context length updates in test mode
-        if not kwargs.get('test_mode', False):
-            # Update context length based on schedule
-            new_context = get_context_length(epoch)
-            
-            # Recreate dataloaders if context changed
-            if new_context != current_context:
-                logger.info(f"Updating context length from {current_context} to {new_context}")
-                current_context = new_context
-                
-                (train_loader, val_loader, test_loader), (train_sampler, val_sampler, test_sampler) = create_dataloaders(
-                    data_dir=data_dir,
-                    manifest_path=manifest_path,
-                    batch_size=batch_size,
-                    sequence_length=current_context,
-                    num_workers=kwargs.get('num_workers', 8),
-                    return_samplers=True,
-                    ddp=is_ddp
-                )
-                
-                # Update trainer's dataloaders
-                trainer.train_loader = train_loader
-                trainer.val_loader = val_loader
-                trainer.test_loader = test_loader
-                
-                # Update total training steps since loader size changed
-                remaining_epochs = num_epochs - epoch
-                trainer.total_training_steps = trainer.global_step + (remaining_epochs * len(train_loader))
-                logger.info(f"Updated KL annealing: will reach max at step {trainer.total_training_steps}")
-        
+
+    # Determine starting epoch for training loop
+    start_epoch = trainer.epoch + 1 if resume_from is not None else 0
+    if resume_from is not None:
+        logger.info(f"Continuing training from epoch {start_epoch} (checkpoint was at epoch {trainer.epoch})")
+
+    if start_epoch >= num_epochs:
+        logger.info(f"Training already completed for {num_epochs} epochs. Exiting.")
+        return trainer.model
+
+    # Training loop
+    for epoch in range(start_epoch, num_epochs):
         # Set epoch for distributed sampler
         if is_ddp:
+            train_sampler = train_loader.sampler if hasattr(train_loader, 'sampler') else None
+            val_sampler = val_loader.sampler if val_loader and hasattr(val_loader, 'sampler') else None
+            test_sampler = test_loader.sampler if test_loader and hasattr(test_loader, 'sampler') else None
+
             if train_sampler:
                 train_sampler.set_epoch(epoch)
             if val_sampler:
                 val_sampler.set_epoch(epoch)
             if test_sampler:
                 test_sampler.set_epoch(epoch)
-        
+
         # Train for one epoch
         trainer.epoch = epoch
         train_metrics = trainer.train_epoch()
-        logger.info(f"Epoch {epoch} (context={current_context}) - Train: {train_metrics}")
+        logger.info(f"Epoch {epoch} - Train: {train_metrics}")
         
         # Skip evaluation in test mode
         if not kwargs.get('test_mode', False):
@@ -1213,10 +1319,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--test_mode", action="store_true", help="Test mode: use only 1 batch for debugging/overfitting test")
-    parser.add_argument("--min_context", type=int, default=4, help="Minimum context length")
-    parser.add_argument("--max_context", type=int, default=20, help="Maximum context length")
-    parser.add_argument("--context_schedule", type=str, default="linear", 
-                       choices=["linear", "exponential", "step"], help="Context length schedule")
+    parser.add_argument("--context_length", type=int, default=20, help="Context length (model uses causal masking for variable lengths)")
 
     # DDP arguments
     # local_rank is deprecated, but we keep it for backward compatibility.
@@ -1226,9 +1329,21 @@ if __name__ == "__main__":
 
     parser.add_argument("--device", type=str, default="cuda", help="Device to train on")
     parser.add_argument("--mixed_precision", action="store_true", help="Use mixed precision")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--kl_weight", type=float, default=0.1, help="KL divergence weight")
+    parser.add_argument("--learning_rate", "--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of dataloader workers")
+
+    # VQ-VAE specific arguments
+    parser.add_argument("--codebook_dim", type=int, default=128, help="Dimension of each codebook entry")
+    parser.add_argument("--num_embeddings", type=int, default=12, help="Number of codebook entries (vocabulary size)")
+    parser.add_argument("--commitment_weight", type=float, default=0.25, help="Commitment loss weight (beta)")
+    parser.add_argument("--reconstruction_weight", type=float, default=1.0, help="Reconstruction loss weight")
+
+    # WandB arguments
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--project_name", type=str, default="vvae-lam", help="WandB project name")
+    parser.add_argument("--run_name", type=str, default=None, help="WandB run name")
+
+    # Scheduler
     parser.add_argument("--scheduler", action="store_true", help="Enable manual LR scheduling with warmup and cosine annealing")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Minimum LR as ratio of base LR (default: 0.1 = 10%% of base)")
 
@@ -1240,17 +1355,22 @@ if __name__ == "__main__":
     parser.add_argument("--anchor_strategy", type=str, default="random", choices=["random", "last"], help="Rollout anchor strategy")
     # Because the encoder outputs T−1 actions, a rollout spanning rollout_horizon steps requires T ≥ rollout_horizon + 1 frames. With --rollout_horizon 2 you need sequence length T ≥ 3 (so setting --min_context 3 enables rollouts immediately). The model skips the rollout branch when that condition fails, producing rollout_loss = 0.
 
-    # Model architecture arguments
-    parser.add_argument("--latent_dim", type=int, default=1024, help="Patch token dimension (default: 1024)")
+    # Model architecture arguments (latent_dim removed for VVAE - fixed at 256 by adapter)
     parser.add_argument("--encoder_depth", type=int, default=3, help="Number of encoder transformer layers")
-    parser.add_argument("--decoder_depth", type=int, default=3, help="Number of decoder transformer layers") 
+    parser.add_argument("--decoder_depth", type=int, default=3, help="Number of decoder transformer layers")
     parser.add_argument("--encoder_heads", type=int, default=8, help="Number of encoder attention heads")
     parser.add_argument("--decoder_heads", type=int, default=8, help="Number of decoder attention heads")
     parser.add_argument("--embed_dim", type=int, default=512, help="Transformer embedding dimension")
     parser.add_argument("--mlp_ratio", type=float, default=4.0, help="MLP hidden dimension multiplier")
     parser.add_argument("--drop_rate", type=float, default=0.0, help="Dropout rate")
     parser.add_argument("--attn_drop_rate", type=float, default=0.0, help="Attention dropout rate")
-    
+
+    # Validation arguments
+    parser.add_argument("--validation_fraction", type=float, default=1.0, help="Fraction of validation set to evaluate each time (0-1, e.g., 0.35 for 35%%)")
+
+    # Resume training arguments
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from (e.g., checkpoints/lam_20251013_121224/latest.pt)")
+
     args = parser.parse_args()
 
     # --- DDP Initialization ---
@@ -1279,12 +1399,12 @@ if __name__ == "__main__":
     # Override settings in test mode
     if args.test_mode:
         print("TEST MODE: Overriding settings")
-        args.kl_weight = 0.0
         args.drop_rate = 0.0
         args.attn_drop_rate = 0.0
-        print(f"  - KL weight set to 0.0")
         print(f"  - Dropout rates set to 0.0")
-    
+
+    print(f"Using context length: {args.context_length} (causal masking handles variable lengths)")
+
     # Train model
     try:
         model = train_with_variable_context(
@@ -1292,13 +1412,10 @@ if __name__ == "__main__":
             manifest_path=args.manifest_path,
             num_epochs=args.num_epochs,
             batch_size=args.batch_size,
-            min_context_length=args.min_context,
-            max_context_length=args.max_context,
-            context_schedule=args.context_schedule,
+            context_length=args.context_length,
             device=args.device,
             mixed_precision=args.mixed_precision,
             learning_rate=args.learning_rate,
-            kl_weight=args.kl_weight,
             num_workers=args.num_workers,
             test_mode=args.test_mode,
             use_scheduler=args.scheduler,
@@ -1309,8 +1426,7 @@ if __name__ == "__main__":
             rollout_prob=args.rollout_prob,
             detach_rollout_first=args.detach_rollout_first,
             anchor_strategy=args.anchor_strategy,
-            # Model architecture parameters
-            latent_dim=args.latent_dim,
+            # Model architecture parameters (no latent_dim for VVAE)
             encoder_depth=args.encoder_depth,
             decoder_depth=args.decoder_depth,
             encoder_heads=args.encoder_heads,
@@ -1319,6 +1435,19 @@ if __name__ == "__main__":
             mlp_ratio=args.mlp_ratio,
             drop_rate=args.drop_rate,
             attn_drop_rate=args.attn_drop_rate,
+            # VQ-VAE specific parameters
+            codebook_dim=args.codebook_dim,
+            num_embeddings=args.num_embeddings,
+            commitment_weight=args.commitment_weight,
+            reconstruction_weight=args.reconstruction_weight,
+            # Validation parameters
+            validation_fraction=args.validation_fraction,
+            # Resume parameters
+            resume_from=args.resume_from,
+            # WandB parameters
+            use_wandb=args.use_wandb,
+            project_name=args.project_name,
+            run_name=args.run_name,
             is_ddp=is_ddp
         )
     finally:

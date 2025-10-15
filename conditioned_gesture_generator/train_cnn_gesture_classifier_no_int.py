@@ -10,9 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import argparse
+import json
 import numpy as np
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
+from typing import Deque, Dict, List, Optional, Tuple
 import wandb
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -21,13 +23,14 @@ import time
 import sys
 import os
 from datetime import datetime
+import h5py
+from collections import deque
 
 # Import our CNN Gesture Classifier implementation
 from .cnn_gesture_classifier_no_int import (
     CNNGestureClassifier, CNNGestureClassifierTrainer, CoordinateQuantizer, 
     compute_classification_loss, decode_predictions, compute_delta_class, create_model_and_trainer
 )
-
 # ============================================================================
 # DATASET
 # ============================================================================
@@ -249,14 +252,186 @@ class StreamingGestureDataset(Dataset):
 
 class GestureDataset(StreamingGestureDataset):
     """Legacy wrapper for backward compatibility."""
-    
+
     def __init__(self, data_dirs, seq_len=250, test_mode=False):
         # Use streaming dataset with moderate cache size
         cache_size = 500 if not test_mode else 0
         super().__init__(data_dirs, seq_len, test_mode, cache_size)
-        
+
         if not test_mode:
             print(f"Using streaming dataset (legacy mode) - cache size: {cache_size}")
+
+
+class OverfitDataset(Dataset):
+    """Dataset that always returns the same single sample for overfitting tests."""
+
+    def __init__(self, sample_data, num_iterations):
+        """
+        Args:
+            sample_data: Single sample tensor [T, 3] or [T, 2]
+            num_iterations: Number of iterations to simulate
+        """
+        self.sample_data = sample_data
+        self.num_iterations = num_iterations
+
+    def __len__(self):
+        return self.num_iterations
+
+    def __getitem__(self, idx):
+        return self.sample_data.clone()
+
+
+class H5ActionSequenceDataset(Dataset):
+    """Expose individual 250-step gesture sequences from HDF5 files."""
+
+    def __init__(
+        self,
+        processed_data_dir,
+        manifest_path=None,
+        split='train',
+        max_open_files: int = 32,
+    ):
+        self.data_dir = Path(processed_data_dir)
+        if not self.data_dir.exists():
+            raise FileNotFoundError(f"Processed data directory {self.data_dir} does not exist")
+
+        if max_open_files <= 0:
+            raise ValueError("max_open_files must be a positive integer")
+
+        if manifest_path and split:
+            with open(manifest_path, 'r') as f:
+                manifest = json.load(f)
+            if 'splits' not in manifest:
+                raise ValueError(f"Manifest at {manifest_path} missing 'splits' key")
+            if split not in manifest['splits']:
+                raise ValueError(
+                    f"Split '{split}' not found in manifest; available splits: {list(manifest['splits'].keys())}"
+                )
+            relative_files = manifest['splits'][split]
+        else:
+            # Fallback: load all *.h5 files in the directory
+            relative_files = [str(path.name) for path in sorted(self.data_dir.glob('*.h5'))]
+
+        self.files: List[Path] = []
+        self.file_metadata: List[Dict] = []
+        self.segment_index: List[Tuple[int, Tuple[int, Optional[int]]]] = []
+        self.sequence_length: Optional[int] = None
+        self.num_channels: Optional[int] = None
+        self._file_handles: Dict[int, Dict[Path, h5py.File]] = {}
+        self._handle_order: Dict[int, Deque[Path]] = {}
+        self.max_open_files = max_open_files
+
+        for rel_path in relative_files:
+            file_path = self.data_dir / rel_path
+            if not file_path.exists():
+                raise FileNotFoundError(f"Referenced file {rel_path} not found in {self.data_dir}")
+
+            with h5py.File(file_path, 'r') as f:
+                if 'actions' not in f:
+                    raise KeyError(f"File {file_path} missing 'actions' dataset")
+                actions_ds = f['actions']
+                if actions_ds.ndim == 4:
+                    n_primary, n_segments, seq_len, channels = actions_ds.shape
+                    entry_kind = 'grid'
+                elif actions_ds.ndim == 3:
+                    n_primary, seq_len, channels = actions_ds.shape
+                    n_segments = 1
+                    entry_kind = 'flat'
+                else:
+                    raise ValueError(
+                        f"Unsupported 'actions' dataset shape {actions_ds.shape} in {file_path};"
+                        " expected 3D or 4D"
+                    )
+
+            if self.sequence_length is None:
+                self.sequence_length = seq_len
+                self.num_channels = channels
+            else:
+                if seq_len != self.sequence_length or channels != self.num_channels:
+                    raise ValueError(
+                        f"Inconsistent action shape detected. Expected ({self.sequence_length}, {self.num_channels})"
+                        f" but found ({seq_len}, {channels}) in {file_path}"
+                    )
+
+            file_id = len(self.files)
+            self.files.append(file_path)
+            self.file_metadata.append(
+                {
+                    'kind': entry_kind,
+                    'shape': (n_primary, n_segments, seq_len, channels),
+                }
+            )
+
+            if entry_kind == 'grid':
+                for primary_idx in range(n_primary):
+                    for segment_idx in range(n_segments):
+                        self.segment_index.append((file_id, (primary_idx, segment_idx)))
+            else:  # flat layout already stores segments individually along axis 0
+                for flat_idx in range(n_primary):
+                    self.segment_index.append((file_id, (flat_idx, None)))
+
+        if not self.segment_index:
+            raise ValueError("No action segments found in the provided HDF5 data")
+
+    def __len__(self):
+        return len(self.segment_index)
+
+    def _get_file_handle(self, file_path: Path) -> h5py.File:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+
+        handles = self._file_handles.setdefault(worker_id, {})
+        order = self._handle_order.setdefault(worker_id, deque())
+
+        if file_path in handles:
+            try:
+                order.remove(file_path)
+            except ValueError:
+                pass  # Handle missing bookkeeping gracefully
+            order.append(file_path)
+            return handles[file_path]
+
+        if len(handles) >= self.max_open_files and order:
+            stale_path = order.popleft()
+            stale_handle = handles.pop(stale_path, None)
+            if stale_handle is not None:
+                stale_handle.close()
+
+        handles[file_path] = h5py.File(file_path, 'r')
+        order.append(file_path)
+        return handles[file_path]
+
+    def __getitem__(self, idx):
+        file_id, entry = self.segment_index[idx]
+        file_path = self.files[file_id]
+        metadata = self.file_metadata[file_id]
+        h5_file = self._get_file_handle(file_path)
+
+        if metadata['kind'] == 'grid':
+            primary_idx, segment_idx = entry
+            action_np = h5_file['actions'][primary_idx, segment_idx]
+        else:
+            flat_idx, _ = entry
+            action_np = h5_file['actions'][flat_idx]
+
+        action_tensor = torch.from_numpy(np.array(action_np, copy=True)).float()
+        return action_tensor
+
+    def _close_all_handles(self) -> None:
+        for worker_handles in self._file_handles.values():
+            for handle in worker_handles.values():
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+        self._file_handles.clear()
+        self._handle_order.clear()
+
+    def __del__(self):
+        try:
+            self._close_all_handles()
+        except Exception:
+            pass
 
 # ============================================================================
 # EVALUATION METRICS
@@ -538,7 +713,7 @@ def train_classifier_model(
     """Training loop with comprehensive logging. Logs training metrics every step."""
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min = 0.01 * lr)
     
     step = 0
     best_val_loss = float('inf')
@@ -726,6 +901,13 @@ def train_classifier_model(
                         'num_classes': model.num_classes,
                         'encoder_channels': model.encoder_channels,
                         'decoder_channels': model.decoder_channels,
+                        'use_tfm_decoder': model.use_tfm_decoder,
+                        'tfm_d_model': model.tfm_d_model,
+                        'tfm_num_layers': model.tfm_num_layers,
+                        'tfm_num_heads': model.tfm_num_heads,
+                        'tfm_mlp_ratio': model.tfm_mlp_ratio,
+                        'tfm_dropout': model.tfm_dropout,
+                        'tfm_attn_dropout': model.tfm_attn_dropout,
                     }
                 }, Path(checkpoint_dir) / 'elite_model.pth')
                 
@@ -760,6 +942,13 @@ def train_classifier_model(
                 'num_classes': model.num_classes,
                 'encoder_channels': model.encoder_channels,
                 'decoder_channels': model.decoder_channels,
+                'use_tfm_decoder': model.use_tfm_decoder,
+                'tfm_d_model': model.tfm_d_model,
+                'tfm_num_layers': model.tfm_num_layers,
+                'tfm_num_heads': model.tfm_num_heads,
+                'tfm_mlp_ratio': model.tfm_mlp_ratio,
+                'tfm_dropout': model.tfm_dropout,
+                'tfm_attn_dropout': model.tfm_attn_dropout,
             }
         }
         torch.save(checkpoint, Path(checkpoint_dir) / f'epoch_{epoch:03d}.pth')
@@ -781,13 +970,20 @@ def load_model_from_checkpoint(checkpoint_path, device='cuda'):
     from .cnn_gesture_classifier_no_int import CNNGestureClassifier, CoordinateQuantizer, CNNGestureClassifierTrainer
     
     model = CNNGestureClassifier(
-        input_dim=2,  # x, y coordinates 
+        input_dim=2,  # x, y coordinates
         sequence_length=config['sequence_length'],
         latent_dim=config['latent_dim'],
         num_classes=config['num_classes'],
         encoder_channels=config['encoder_channels'],
         decoder_channels=config['decoder_channels'],
         kernel_size=config.get('kernel_size', 5),  # Default kernel size
+        use_tfm_decoder=config.get('use_tfm_decoder', False),
+        tfm_d_model=config.get('tfm_d_model', 512),
+        tfm_num_layers=config.get('tfm_num_layers', 6),
+        tfm_num_heads=config.get('tfm_num_heads', 8),
+        tfm_mlp_ratio=config.get('tfm_mlp_ratio', 4.0),
+        tfm_dropout=config.get('tfm_dropout', 0.1),
+        tfm_attn_dropout=config.get('tfm_attn_dropout', 0.1),
     ).to(device)
     
     # Load state dict
@@ -813,6 +1009,11 @@ def main():
     parser = argparse.ArgumentParser(description='Train CNN Gesture Classifier')
     parser.add_argument('--data_dir', type=str, action='append', help='Directory containing training data (can be specified multiple times)')
     parser.add_argument('--val_data_dir', type=str, action='append', help='Directory containing validation data (can be specified multiple times)')
+    parser.add_argument('--processed_data_dir', type=str, help='Directory containing preprocessed gesture trajectories in HDF5 format')
+    parser.add_argument('--processed_val_dir', type=str, help='Optional directory for validation trajectories (defaults to processed_data_dir)')
+    parser.add_argument('--manifest', type=str, help='Path to manifest JSON describing train/val/test splits for HDF5 datasets')
+    parser.add_argument('--train_split', type=str, default='train', help="Split name to use from manifest for training (default: 'train')")
+    parser.add_argument('--val_split', type=str, default='validation', help="Split name to use from manifest for validation (default: 'validation')")
     parser.add_argument('--resume', type=str, help='Path to checkpoint to resume training from')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_epochs', type=int, default=100)
@@ -844,6 +1045,22 @@ def main():
                        help='Run in test mode with synthetic data (no real data files needed)')
     parser.add_argument('--w_smooth', type=float, default=0.0,
                        help='Weight for delta smoothness loss (default: 0.0, disabled)')
+    parser.add_argument('--use_tfm_decoder', action='store_true',
+                       help='Use Transformer decoder instead of CNN decoder')
+    parser.add_argument('--tfm_d_model', type=int, default=512,
+                       help='Transformer model dimension (default: 512)')
+    parser.add_argument('--tfm_num_layers', type=int, default=6,
+                       help='Number of transformer layers (default: 6)')
+    parser.add_argument('--tfm_num_heads', type=int, default=8,
+                       help='Number of attention heads (default: 8)')
+    parser.add_argument('--tfm_mlp_ratio', type=float, default=4.0,
+                       help='Transformer MLP ratio (default: 4.0)')
+    parser.add_argument('--tfm_dropout', type=float, default=0.1,
+                       help='Transformer dropout rate (default: 0.1)')
+    parser.add_argument('--tfm_attn_dropout', type=float, default=0.1,
+                       help='Transformer attention dropout rate (default: 0.1)')
+    parser.add_argument('--overfit', action='store_true',
+                       help='Run overfit test on single sample for (epochs * 50) iterations')
     args = parser.parse_args()
     
     # Convert single directories to lists for backward compatibility
@@ -851,6 +1068,13 @@ def main():
         args.data_dir = []
     if args.val_data_dir is None:
         args.val_data_dir = []
+
+    using_h5 = args.processed_data_dir is not None
+    if args.processed_data_dir and args.processed_val_dir is None:
+        args.processed_val_dir = args.processed_data_dir
+
+    if using_h5 and (args.data_dir or args.val_data_dir):
+        parser.error("Specify either HDF5 inputs (--processed_data_dir/--manifest) or raw directories (--data_dir/--val_data_dir), not both")
     
     # Handle checkpoint resumption
     resume_checkpoint = None
@@ -909,33 +1133,59 @@ def main():
         if args.vis_interval > 100:
             print(f"Reducing vis_interval from {args.vis_interval} to 100 for test mode")
             args.vis_interval = 100
+
+    # Overfit mode validation
+    if args.overfit:
+        print("Running in OVERFIT MODE with single sample")
+        # Override settings for overfitting test
+        total_iterations = args.num_epochs * 50
+        print(f"Total iterations: {total_iterations} (epochs {args.num_epochs} * 50)")
+        args.batch_size = 1  # Always use batch size 1 for overfit
+        args.wandb_project = f"{args.wandb_project}-overfit"
+        # More frequent monitoring for overfit
+        if args.val_interval > 10:
+            print(f"Reducing val_interval from {args.val_interval} to 10 for overfit mode")
+            args.val_interval = 10
+        if args.vis_interval > 20:
+            print(f"Reducing vis_interval from {args.vis_interval} to 20 for overfit mode")
+            args.vis_interval = 20
     else:
-        # Validate required arguments for real training
-        if not args.data_dir:
-            # Try default directories if none specified
-            default_dirs = [
-                'resource/gesture_data/train',
-                'resource/dataset/final_data/train_subset'
-            ]
-            existing_dirs = [d for d in default_dirs if Path(d).exists()]
-            if existing_dirs:
-                args.data_dir = existing_dirs
-                print(f"No --data_dir specified, using default directories: {args.data_dir}")
-            else:
-                parser.error("--data_dir is required when not in test mode")
+        if using_h5:
+            if not args.processed_data_dir:
+                parser.error("--processed_data_dir is required when using HDF5 inputs")
+            if not Path(args.processed_data_dir).exists():
+                parser.error(f"Processed data directory {args.processed_data_dir} does not exist")
+            if args.processed_val_dir and not Path(args.processed_val_dir).exists():
+                parser.error(f"Validation processed directory {args.processed_val_dir} does not exist")
+            if args.manifest and not Path(args.manifest).exists():
+                parser.error(f"Manifest file {args.manifest} does not exist")
+        else:
+            # Validate required arguments for real training
+            if not args.data_dir:
+                # Try default directories if none specified
+                default_dirs = [
+                    'resource/gesture_data/train',
+                    'resource/dataset/final_data/train_subset'
+                ]
+                existing_dirs = [d for d in default_dirs if Path(d).exists()]
+                if existing_dirs:
+                    args.data_dir = existing_dirs
+                    print(f"No --data_dir specified, using default directories: {args.data_dir}")
+                else:
+                    parser.error("--data_dir is required when not in test mode and no HDF5 inputs are provided")
                 
-        if not args.val_data_dir:
-            # Try default validation directories
-            default_val_dirs = [
-                'resource/gesture_data/val',
-                'resource/dataset/final_data/val_subset'
-            ]
-            existing_val_dirs = [d for d in default_val_dirs if Path(d).exists()]
-            if existing_val_dirs:
-                args.val_data_dir = existing_val_dirs
-                print(f"No --val_data_dir specified, using default directories: {args.val_data_dir}")
-            else:
-                parser.error("--val_data_dir is required when not in test mode")
+            if not args.val_data_dir:
+                # Try default validation directories
+                default_val_dirs = [
+                    'resource/gesture_data/val',
+                    'resource/dataset/final_data/val_subset'
+                ]
+                existing_val_dirs = [d for d in default_val_dirs if Path(d).exists()]
+                if existing_val_dirs:
+                    args.val_data_dir = existing_val_dirs
+                    print(f"No --val_data_dir specified, using default directories: {args.val_data_dir}")
+                else:
+                    parser.error("--val_data_dir is required when not in test mode and no HDF5 inputs are provided")
     
     # Setup device
     if args.device == 'auto':
@@ -946,9 +1196,14 @@ def main():
     
     # Create timestamped run directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_name = f"cnn_ld{args.latent_dim}_ec{'-'.join(map(str, encoder_channels))}_dc{'-'.join(map(str, decoder_channels))}"
+    decoder_type = "TFM" if args.use_tfm_decoder else "CNN"
+    run_name = f"{decoder_type.lower()}_ld{args.latent_dim}_ec{'-'.join(map(str, encoder_channels))}_dc{'-'.join(map(str, decoder_channels))}"
+    if args.use_tfm_decoder:
+        run_name += f"_tfm{args.tfm_d_model}_{args.tfm_num_layers}L_{args.tfm_num_heads}H"
     if args.test:
         run_name = f"TEST_{run_name}"
+    elif args.overfit:
+        run_name = f"OVERFIT_{run_name}"
     
     # Create run-specific checkpoint directory
     run_dir_name = f"run_{timestamp}_{run_name}"
@@ -963,36 +1218,85 @@ def main():
         name=run_name
     )
     
-    # Choose dataset type based on streaming flag
-    if args.streaming and not args.test:
+    # Choose dataset type based on provided inputs
+    if args.overfit:
+        print("Creating OVERFIT dataset from single sample")
+        # Create a single sample for overfitting
+        np.random.seed(42)  # Deterministic sample
+        sample_data = np.zeros((args.sequence_length, 3), dtype=np.float32)
+
+        # Generate a simple deterministic gesture pattern
+        num_gestures = 2
+        for g in range(num_gestures):
+            start_t = g * (args.sequence_length // num_gestures)
+            length = args.sequence_length // num_gestures - 10
+
+            start_x, start_y = 0.2 + g * 0.3, 0.3 + g * 0.2  # Different start points
+            end_x, end_y = 0.7 - g * 0.2, 0.8 - g * 0.3    # Different end points
+
+            for i, t in enumerate(range(start_t, start_t + length)):
+                if t < args.sequence_length:
+                    alpha = i / (length - 1) if length > 1 else 0
+                    sample_data[t, 0] = start_x + alpha * (end_x - start_x)
+                    sample_data[t, 1] = start_y + alpha * (end_y - start_y)
+                    sample_data[t, 2] = 1.0  # Pressure on
+
+        sample_tensor = torch.from_numpy(sample_data)
+        total_iterations = args.num_epochs * 50
+
+        train_dataset = OverfitDataset(sample_tensor, total_iterations)
+        val_dataset = OverfitDataset(sample_tensor, 10)  # Small validation set
+
+        print(f"Overfit sample shape: {sample_tensor.shape}")
+        print(f"Training iterations: {total_iterations}, Validation samples: 10")
+
+    elif using_h5 and not args.test:
+        print("Using HDF5 action sequence dataset")
+        train_dataset = H5ActionSequenceDataset(
+            processed_data_dir=args.processed_data_dir,
+            manifest_path=args.manifest,
+            split=args.train_split
+        )
+        val_dataset = H5ActionSequenceDataset(
+            processed_data_dir=args.processed_val_dir,
+            manifest_path=args.manifest,
+            split=args.val_split
+        )
+        if train_dataset.sequence_length and args.sequence_length != train_dataset.sequence_length:
+            print(
+                f"Adjusting sequence_length from {args.sequence_length} to "
+                f"{train_dataset.sequence_length} based on HDF5 data"
+            )
+            args.sequence_length = train_dataset.sequence_length
+    elif args.streaming and not args.test:
         print("Using STREAMING dataset for fast startup")
         train_cache_size = args.cache_size
         val_cache_size = max(500, args.cache_size // 4)  # Smaller cache for validation
-        
+
         print(f"Creating streaming datasets - Train cache: {train_cache_size}, Val cache: {val_cache_size}")
-        
+
         train_dataset = StreamingGestureDataset(
-            args.data_dir, 
-            seq_len=args.sequence_length, 
+            args.data_dir,
+            seq_len=args.sequence_length,
             test_mode=False,
             cache_size=train_cache_size
         )
         val_dataset = StreamingGestureDataset(
-            args.val_data_dir, 
-            seq_len=args.sequence_length, 
+            args.val_data_dir,
+            seq_len=args.sequence_length,
             test_mode=False,
             cache_size=val_cache_size
         )
     else:
         print("Using LEGACY dataset (loads all data into memory at startup)")
         train_dataset = GestureDataset(
-            args.data_dir if not args.test else None, 
-            seq_len=args.sequence_length, 
+            args.data_dir if not args.test else None,
+            seq_len=args.sequence_length,
             test_mode=args.test
         )
         val_dataset = GestureDataset(
-            args.val_data_dir if not args.test else None, 
-            seq_len=args.sequence_length, 
+            args.val_data_dir if not args.test else None,
+            seq_len=args.sequence_length,
             test_mode=args.test
         )
     
@@ -1013,6 +1317,13 @@ def main():
             encoder_channels=encoder_channels,
             decoder_channels=decoder_channels,
             kernel_size=args.kernel_size,
+            use_tfm_decoder=args.use_tfm_decoder,
+            tfm_d_model=args.tfm_d_model,
+            tfm_num_layers=args.tfm_num_layers,
+            tfm_num_heads=args.tfm_num_heads,
+            tfm_mlp_ratio=args.tfm_mlp_ratio,
+            tfm_dropout=args.tfm_dropout,
+            tfm_attn_dropout=args.tfm_attn_dropout,
         ).to(device)
         
         quantizer = CoordinateQuantizer(num_classes=args.num_classes)
@@ -1028,12 +1339,26 @@ def main():
         print(f"Epochs: {args.num_epochs}")
         print(f"Batch size: {args.batch_size}")
         print(f"Sequence length: {args.sequence_length}")
+        print(f"Decoder type: {'Transformer' if args.use_tfm_decoder else 'CNN'}")
+        if args.use_tfm_decoder:
+            print(f"TFM d_model: {args.tfm_d_model}, layers: {args.tfm_num_layers}, heads: {args.tfm_num_heads}")
         print(f"Encoder channels: {encoder_channels}")
         print(f"Decoder channels: {decoder_channels}")
         print(f"Model parameters: {num_params:,}")
         print(f"Train samples: {len(train_dataset)}")
         print(f"Val samples: {len(val_dataset)}")
         print("================================================\n")
+    elif args.overfit:
+        print("\n=== OVERFIT MODE SUMMARY ===")
+        print(f"Total iterations: {len(train_dataset)}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Sequence length: {args.sequence_length}")
+        print(f"Decoder type: {'Transformer' if args.use_tfm_decoder else 'CNN'}")
+        if args.use_tfm_decoder:
+            print(f"TFM d_model: {args.tfm_d_model}, layers: {args.tfm_num_layers}, heads: {args.tfm_num_heads}")
+        print(f"Model parameters: {num_params:,}")
+        print(f"Expected loss: Should approach 0 (perfect overfitting)")
+        print("=============================\n")
     
     # Prepare training parameters
     start_epoch = 0
@@ -1156,7 +1481,7 @@ python -m conditioned_gesture_generator.train_cnn_gesture_classifier \
 
 # WANDB METRICS TO MONITOR:
 # - val/mse (target: <0.01)
-# - val/x_accuracy, val/y_accuracy (target: >0.8)  
+# - val/x_accuracy, val/y_accuracy (target: >0.8)
 # - val/reconstructions (visual quality every vis_interval steps)
 # - val/latent_space (clustering visualization)
 # - val/generated (sample quality from random latent vectors)
@@ -1165,4 +1490,61 @@ python -m conditioned_gesture_generator.train_cnn_gesture_classifier \
 # - gesture_data format: [timesteps, 3] or [num_sequences, seq_len, 3] from stage 1 processing
 # - trajectory format: [7, 250, 3] action blocks from full preprocessing pipeline
 # - Mixed datasets: Can combine both formats in single training run for maximum data utilization
+
+# NEW FEATURES:
+# 1. TRANSFORMER DECODER:
+# - Use --use_tfm_decoder flag to use transformer-based decoder instead of CNN decoder
+# - Additional TFM parameters: --tfm_d_model, --tfm_num_layers, --tfm_num_heads, etc.
+# - Model config automatically saves decoder type for checkpoint loading
+
+# 2. OVERFIT TEST:
+# - Use --overfit flag to run overfitting test on single sample
+# - Runs for (epochs * 50) iterations on the same deterministic sample
+# - Expected behavior: Loss should approach 0, demonstrating perfect memorization
+
+# TRANSFORMER DECODER EXAMPLES:
+
+# 0c. TEST WITH TRANSFORMER DECODER (2 minutes)
+python -m conditioned_gesture_generator.train_cnn_gesture_classifier_no_int --test --use_tfm_decoder
+
+# 0d. OVERFIT TEST WITH CNN DECODER (5 minutes)
+python -m conditioned_gesture_generator.train_cnn_gesture_classifier_no_int --overfit --num_epochs 10
+
+# 0e. OVERFIT TEST WITH TRANSFORMER DECODER (5 minutes)
+python -m conditioned_gesture_generator.train_cnn_gesture_classifier_no_int --overfit --num_epochs 10 --use_tfm_decoder
+
+# 3b. QUICK TRAINING WITH TRANSFORMER DECODER (15 minutes)
+python -m conditioned_gesture_generator.train_cnn_gesture_classifier_no_int \\
+    --batch_size 8 \\
+    --num_epochs 3 \\
+    --lr 1e-3 \\
+    --latent_dim 64 \\
+    --use_tfm_decoder \\
+    --tfm_d_model 256 \\
+    --tfm_num_layers 4 \\
+    --tfm_num_heads 4 \\
+    --wandb_project cnn-tfm-gesture-classifier-test
+
+# 3c. FULL TRAINING WITH TRANSFORMER DECODER (3-4 hours)
+python -m conditioned_gesture_generator.train_cnn_gesture_classifier_no_int \\
+    --batch_size 16 \\
+    --num_epochs 100 \\
+    --lr 5e-5 \\
+    --latent_dim 128 \\
+    --use_tfm_decoder \\
+    --tfm_d_model 512 \\
+    --tfm_num_layers 6 \\
+    --tfm_num_heads 8 \\
+    --wandb_project cnn-tfm-gesture-classifier-full
+
+# 3d. RESUME TFM TRAINING FROM CHECKPOINT
+python -m conditioned_gesture_generator.train_cnn_gesture_classifier_no_int \\
+    --resume checkpoints/run_20241231_120000_tfm_model/elite_model.pth \\
+    --num_epochs 200 \\
+    --wandb_project cnn-tfm-gesture-classifier-resumed
+
+# EXPECTED RESULTS FOR NEW FEATURES:
+# Transformer Decoder: Generally better reconstruction quality, more parameters
+# Overfit Test: Loss should go to ~0.001 or lower, perfect reconstruction of single sample
+# Config Saving: Checkpoints include decoder type, can resume TFM or CNN models correctly
 """
