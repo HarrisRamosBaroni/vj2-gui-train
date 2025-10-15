@@ -28,6 +28,7 @@ FILES_TO_SYNC=(
     "training/migrate_npz_to_npy.py"
     "training/train_v2.py"
     "training/utils.py"
+    "training/get_subset_h5.sh"
     "preprocess/generate_split_manifest.py"
     "vvae/"
     # ".gitignore"
