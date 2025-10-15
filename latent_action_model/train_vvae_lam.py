@@ -1010,7 +1010,11 @@ class VVAELAMTrainer:
     def load_checkpoint(self, checkpoint_path: str):
         """Load model checkpoint."""
         if self.use_ddp:
-            dist.barrier() # Ensure all processes are ready before loading
+            if 'cuda' in self.device:
+                device_id = int(self.device.split(':')[-1])
+                dist.barrier(device_ids=[device_id])
+            else:
+                dist.barrier() # Fallback for CPU
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
@@ -1290,7 +1294,11 @@ def train_with_variable_context(
 
                 # Synchronize before saving checkpoint
                 if is_ddp:
-                    dist.barrier()
+                    if 'cuda' in device:
+                        device_id = int(device.split(':')[-1])
+                        dist.barrier(device_ids=[device_id])
+                    else:
+                        dist.barrier() # Fallback for CPU
                 
                 # Save checkpoint
                 is_best = val_metrics['loss'] < trainer.best_val_loss
