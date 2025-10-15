@@ -16,7 +16,7 @@ wandb login
 ```
 - Must have `torch`. Install with `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121` or other appropriate version given the hardware. 
 - Other dependencies:
-`pip install timm einops h5py plotly matplotlib scipy seaborn`
+`pip install timm einops h5py plotly matplotlib scipy opencv-python psutil omegaconf decord av taming-transformers`
 
 ### Run training
 Choose `<number of devices>` and proceed with command:
