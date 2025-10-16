@@ -1373,6 +1373,33 @@ class VQLAMEncoder(nn.Module):
             if isinstance(block.mlp, nn.Sequential):
                 block.mlp[-2].weight.data.div_(layer_scale)
 
+    def _create_shifted_causal_mask(self, T: int, N: int, device: torch.device) -> torch.Tensor:
+        """
+        Create shifted causal mask for Genie-style encoding.
+        When encoding action for transition t→(t+1), allow seeing frames [0, ..., t+1].
+
+        Args:
+            T: Number of frames in sequence
+            N: Number of patches per frame
+            device: Device for mask tensor
+
+        Returns:
+            mask: [T*N, T*N] attention mask where -inf blocks attention
+        """
+        # Create frame-level mask: frame t can see frames [0, 1, ..., t+1]
+        # Standard causal: diagonal=1 means frame t sees [0, ..., t]
+        # Shifted causal: diagonal=2 means frame t sees [0, ..., t+1]
+        frame_mask = torch.triu(
+            torch.full((T, T), float('-inf'), device=device),
+            diagonal=2  # Shifted by 1: allow seeing one frame into the future
+        )  # [T, T]
+
+        # Expand to patch level: each frame becomes N×N block
+        mask = frame_mask.repeat_interleave(N, dim=0).repeat_interleave(N, dim=1)
+        # [T*N, T*N]
+
+        return mask
+
     def forward(self, z_sequence):
         """
         Args:
@@ -1408,9 +1435,13 @@ class VQLAMEncoder(nn.Module):
         # Reshape to sequence: [B, T*N, embed_dim]
         x = x.reshape(B, T * N, self.embed_dim)
 
-        # Apply transformer blocks (no CLS token - process full sequence)
+        # Create shifted causal mask for Genie-style encoding
+        # Position t can see frames [0, ..., t+1] to encode action t→(t+1)
+        causal_mask = self._create_shifted_causal_mask(T, N, x.device)
+
+        # Apply transformer blocks with shifted causal masking
         for block in self.blocks:
-            x = block(x)
+            x = block(x, mask=causal_mask)
 
         # Normalize output
         x = self.norm(x)  # [B, T*N, embed_dim]
