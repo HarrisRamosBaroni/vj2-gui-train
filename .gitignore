@@ -2,3 +2,10 @@ checkpoints*
 wandb
 **/__pycache__
 **/.DS_Store
+
+train/
+Train/
+Validate/
+job_logs/
+mother/
+train_data/
