@@ -82,6 +82,8 @@ def save_model(
 def load_model(
     checkpoint_path: str,
     device: str = 'cuda',
+    num_encoder_blocks: int = None,
+    num_decoder_blocks: int = None,
 ):
     """
     Load model checkpoint and reconstruct the WorldModel.
@@ -89,6 +91,8 @@ def load_model(
     Args:
         checkpoint_path: Path to the checkpoint file
         device: Device to load the model to
+        num_encoder_blocks: Override num_encoder_blocks (for old checkpoints missing this)
+        num_decoder_blocks: Override num_decoder_blocks (for old checkpoints missing this)
 
     Returns:
         model: Reconstructed WorldModel instance
@@ -101,6 +105,15 @@ def load_model(
 
     # Reconstruct model from saved config
     model_config = checkpoint['model_config']
+
+    # Use overrides if provided, otherwise fallback to config or defaults
+    final_num_encoder_blocks = num_encoder_blocks if num_encoder_blocks is not None else model_config.get('num_encoder_blocks', 3)
+    final_num_decoder_blocks = num_decoder_blocks if num_decoder_blocks is not None else model_config.get('num_decoder_blocks', 3)
+
+    logger.info(f"Model reconstruction parameters:")
+    logger.info(f"  num_encoder_blocks: {final_num_encoder_blocks} (override={num_encoder_blocks}, config={model_config.get('num_encoder_blocks', 'missing')})")
+    logger.info(f"  num_decoder_blocks: {final_num_decoder_blocks} (override={num_decoder_blocks}, config={model_config.get('num_decoder_blocks', 'missing')})")
+
     model = WorldModel(
         d_model=model_config['d_model'],
         d_code_a=model_config['d_code_a'],
@@ -109,6 +122,9 @@ def load_model(
         num_lvq_levels_h=model_config['num_lvq_levels_h'],
         codebook_sizes_a=tuple(model_config['codebook_sizes_a']),
         codebook_sizes_h=tuple(model_config['codebook_sizes_h']),
+        num_encoder_blocks=final_num_encoder_blocks,
+        num_decoder_blocks=final_num_decoder_blocks,
+        decay=model_config.get('decay', 0.99),  # Backward compatibility
         use_random_temporal_pe=model_config.get('use_random_temporal_pe', False),  # Backward compatibility
         max_pe_offset=model_config.get('max_pe_offset', 120),  # Backward compatibility
     ).to(device)
@@ -205,11 +221,20 @@ def compute_rollout_loss(
     ablate_world: bool = False,
 ) -> dict:
     """
-    Compute teacher forcing loss and rollout losses with context replacement.
+    Compute teacher forcing loss and rollout losses using diagonal extraction.
+
+    Per description.md lines 128-177: Uses diagonal loss approach where we extract
+    the main diagonal from the prediction matrix S. This diagonal represents true
+    autoregressive rollout predictions without redundancy.
 
     The predictor uses previous predictions as context (input) to simulate rollout.
     Action codes and world embedding are extracted ONCE from GT and remain fixed.
     Only the dynamics predictor receives updated context during rollout.
+
+    Diagonal extraction (description.md:160):
+    - S_{k,k} represents the k-th prediction from the k-th rollout step
+    - This is equivalent to true autoregressive generation
+    - Avoids redundancy in the lower triangle of the prediction matrix
 
     Token masking (per description.md:85):
     - Applied POST tokenization to world encoder and dynamics predictor
@@ -219,7 +244,8 @@ def compute_rollout_loss(
         model: WorldModel instance
         h_sequence: Ground truth sequence [B, T, C=16, H=64, W=64]
         rollout_steps: Number of rollout steps (default: 4)
-        weights: Tuple of weights for (TF, Roll1, Roll2, Roll3, Roll4) losses (default: (1.0, 0.8, 0.5, 0.3, 0.1))
+        weights: Tuple where weights[0] is applied to TF loss (default: (1.0, ...))
+                 Diagonal losses use the formula from description.md: w_k = 1 - (k-1)/K with normalization
         mask_prob: Probability of masking tokens (default: 0.0 = no masking)
         ablate_action: If True, zero out all action codes (default: False)
         ablate_world: If True, zero out world embedding (default: False)
@@ -228,7 +254,7 @@ def compute_rollout_loss(
         Dictionary containing:
             - 'total_recon_loss': Weighted sum of all reconstruction losses
             - 'tf_loss': Teacher forcing loss
-            - 'rollout_losses': List of rollout losses for each step
+            - 'rollout_losses': List of diagonal losses for each step (S_{k,k} elements)
             - 'rvq_losses': Dictionary of RVQ losses from teacher forcing pass
     """
     B, T, C, H, W = h_sequence.shape
@@ -291,9 +317,11 @@ def compute_rollout_loss(
     }
 
     # =========================================================================
-    # Step 2: Rollout Simulation (only predictor uses updated context)
+    # Step 2: Rollout Simulation with Diagonal Extraction (description.md:128-177)
     # =========================================================================
     # Action codes and world embedding are FIXED from GT (already extracted above)
+    # We build a prediction matrix S where S_{k,k} represents the k-th prediction
+    # from the k-th rollout step (true autoregressive behavior)
     rollout_losses = []
 
     # Start with ground truth as initial context
@@ -325,20 +353,29 @@ def compute_rollout_loss(
         pred_frames_rollout = model.detokenizer(pred_tokens)  # [B*(T-1), C, H, W]
         pred_frames_rollout = pred_frames_rollout.view(B, T - 1, C, H, W)  # [B, T-1, C, H, W]
 
-        # Compute rollout loss for this step with redundancy masking
-        # Per description.md lines 94-113: "apply a mask from 0 to k-1 (inclusive)"
-        # For rollout step k, mask positions [0:k] to avoid counting redundant predictions
-        # Only compute loss on NEW predictions at positions [k+1:]
-        mask_end_idx = step + 1  # step=0 masks [0:1], step=1 masks [0:2], etc.
+        # =====================================================================
+        # DIAGONAL EXTRACTION (description.md:160)
+        # =====================================================================
+        # Extract diagonal element S_{step+1, step+1}:
+        # - Step 0: Extract S_{1,1} = pred_frames_rollout[:, 0] (1st prediction from 1st rollout)
+        # - Step 1: Extract S_{2,2} = pred_frames_rollout[:, 1] (2nd prediction from 2nd rollout)
+        # - Step k: Extract S_{k+1,k+1} = pred_frames_rollout[:, k] (k+1-th prediction from k+1-th rollout)
+        #
+        # This diagonal represents true autoregressive predictions:
+        # S_{1,1}: Predicts frame 1 from frame 0
+        # S_{2,2}: Predicts frame 2 from frame 0 + pred1
+        # S_{3,3}: Predicts frame 3 from frame 0 + pred1 + pred2
+        # etc.
 
-        if mask_end_idx < pred_frames_rollout.shape[1]:
-            # Compute loss only on non-masked positions [mask_end_idx:]
-            rollout_loss = F.mse_loss(
-                pred_frames_rollout[:, mask_end_idx:],    # New predictions at [k+1:]
-                h_sequence[:, mask_end_idx + 1:]           # Corresponding GT frames
-            )
+        if step < pred_frames_rollout.shape[1]:
+            # Extract the diagonal element
+            diagonal_pred = pred_frames_rollout[:, step, :, :, :]  # [B, C, H, W]
+            diagonal_gt = h_sequence[:, step + 1, :, :, :]         # [B, C, H, W]
+
+            # Compute loss for this diagonal element
+            rollout_loss = F.mse_loss(diagonal_pred, diagonal_gt)
         else:
-            # All positions are masked (shouldn't happen with normal rollout_steps)
+            # Step exceeds sequence length (shouldn't happen with proper rollout_steps)
             rollout_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
         rollout_losses.append(rollout_loss)
@@ -354,10 +391,27 @@ def compute_rollout_loss(
     # =========================================================================
     # Step 3: Compute weighted total reconstruction loss
     # =========================================================================
-    # Combine teacher forcing + rollout losses with weights
-    total_recon_loss = weights[0] * tf_loss
-    for i, rollout_loss in enumerate(rollout_losses):
-        total_recon_loss += weights[i + 1] * rollout_loss
+    # Per description.md lines 164-175: Use linear weight schedule with normalization
+    # w_k = 1 - (k-1)/K, where k ∈ [1, K]
+    # Z = Σ(k=1 to K) w_k (normalization constant)
+
+    K = rollout_steps
+
+    # Compute diagonal weights per description.md formula
+    diagonal_weights = []
+    for k in range(1, K + 1):
+        w_k = 1.0 - (k - 1) / K
+        diagonal_weights.append(w_k)
+
+    # Normalization constant Z
+    Z = sum(diagonal_weights)
+
+    # Compute normalized weighted diagonal loss
+    diagonal_loss = sum((w_k / Z) * loss for w_k, loss in zip(diagonal_weights, rollout_losses))
+
+    # Total reconstruction loss = TF loss + diagonal loss
+    # Note: weights[0] is applied to TF loss (usually 1.0)
+    total_recon_loss = weights[0] * tf_loss + diagonal_loss
 
     return {
         'total_recon_loss': total_recon_loss,
@@ -565,11 +619,35 @@ def train(
         if config_path.exists():
             loaded_config = load_training_config(str(config_path))
 
-            # Track which parameters are being overridden
-            overrides = []
+            # Define which parameters are part of model architecture (cannot be overridden)
+            # vs training parameters (can be overridden via CLI)
+            architecture_params = {
+                'd_model', 'd_code_a', 'd_code_h',
+                'num_lvq_levels_a', 'num_lvq_levels_h',
+                'codebook_sizes_a', 'codebook_sizes_h',
+                'num_encoder_blocks', 'num_decoder_blocks',
+                'use_random_temporal_pe', 'max_pe_offset',
+            }
 
-            # Apply loaded config, but allow CLI overrides
-            # We check each parameter and see if it differs from the loaded config
+            # Function parameter defaults (to detect CLI overrides)
+            defaults = {
+                'batch_size': 8, 'sequence_length': 8,
+                'epochs': 100, 'lr': 1e-4, 'num_workers': 4,
+                'd_model': 256, 'd_code_a': 128, 'd_code_h': 128,
+                'num_lvq_levels_a': 3, 'num_lvq_levels_h': 6,
+                'codebook_sizes_a': (12, 64, 256), 'codebook_sizes_h': (12, 24, 48, 256, 256, 256),
+                'num_encoder_blocks': 3, 'num_decoder_blocks': 3,
+                'use_frame_masking': True, 'frame_mask_prob': 0.1,
+                'use_rollout': True, 'rollout_steps': 4,
+                'rollout_weights': (1.0, 0.8, 0.5, 0.3, 0.1),
+                'val_frequency': 0.1, 'val_size_percent': 1.0,
+                'codebook_ema_decay_init': 0.8,
+                'reinit_dead_codes_interval': 1000,
+                'dead_code_threshold': 0.01,
+                'use_random_temporal_pe': False, 'max_pe_offset': 120,
+                'ablate_action': False, 'ablate_world': False,
+            }
+
             original_values = {
                 'batch_size': batch_size, 'sequence_length': sequence_length,
                 'epochs': epochs, 'lr': lr, 'num_workers': num_workers,
@@ -584,10 +662,12 @@ def train(
                 'codebook_ema_decay_init': codebook_ema_decay_init,
                 'reinit_dead_codes_interval': reinit_dead_codes_interval,
                 'dead_code_threshold': dead_code_threshold,
+                'use_random_temporal_pe': use_random_temporal_pe, 'max_pe_offset': max_pe_offset,
                 'ablate_action': ablate_action, 'ablate_world': ablate_world,
             }
 
-            # Override with loaded config, but keep CLI values if they differ from defaults
+            overrides = []
+
             for key, cli_value in original_values.items():
                 if key in loaded_config:
                     loaded_value = loaded_config[key]
@@ -595,49 +675,63 @@ def train(
                     if isinstance(loaded_value, list) and isinstance(cli_value, tuple):
                         loaded_value = tuple(loaded_value)
 
-                    # If CLI value differs from loaded config, it's an override
-                    if cli_value != loaded_value:
-                        overrides.append(f"{key}: {loaded_value} -> {cli_value}")
-                    else:
-                        # Use loaded config value
-                        if key == 'batch_size': batch_size = loaded_value
-                        elif key == 'sequence_length': sequence_length = loaded_value
-                        elif key == 'epochs': epochs = loaded_value
-                        elif key == 'lr': lr = loaded_value
-                        elif key == 'num_workers': num_workers = loaded_value
-                        elif key == 'd_model': d_model = loaded_value
-                        elif key == 'd_code_a': d_code_a = loaded_value
-                        elif key == 'd_code_h': d_code_h = loaded_value
-                        # Note: num_lvq_levels_a and num_lvq_levels_h are ignored - always inferred from codebook_sizes
-                        elif key == 'codebook_sizes_a':
-                            codebook_sizes_a = loaded_value
-                            num_lvq_levels_a = len(codebook_sizes_a)  # Recalculate from codebook sizes
-                        elif key == 'codebook_sizes_h':
-                            codebook_sizes_h = loaded_value
-                            num_lvq_levels_h = len(codebook_sizes_h)  # Recalculate from codebook sizes
-                        elif key == 'num_encoder_blocks': num_encoder_blocks = loaded_value
-                        elif key == 'num_decoder_blocks': num_decoder_blocks = loaded_value
-                        elif key == 'use_frame_masking': use_frame_masking = loaded_value
-                        elif key == 'frame_mask_prob': frame_mask_prob = loaded_value
-                        elif key == 'use_rollout': use_rollout = loaded_value
-                        elif key == 'rollout_steps': rollout_steps = loaded_value
-                        elif key == 'rollout_weights': rollout_weights = loaded_value
-                        elif key == 'val_frequency': val_frequency = loaded_value
-                        elif key == 'val_size_percent': val_size_percent = loaded_value
-                        elif key == 'codebook_ema_decay_init': codebook_ema_decay_init = loaded_value
-                        elif key == 'reinit_dead_codes_interval': reinit_dead_codes_interval = loaded_value
-                        elif key == 'dead_code_threshold': dead_code_threshold = loaded_value
-                        elif key == 'use_random_temporal_pe': use_random_temporal_pe = loaded_value
-                        elif key == 'max_pe_offset': max_pe_offset = loaded_value
-                        elif key == 'ablate_action': ablate_action = loaded_value
-                        elif key == 'ablate_world': ablate_world = loaded_value
+                    # Determine if this is a CLI override or default value
+                    is_cli_override = (cli_value != defaults.get(key, cli_value))
+                    is_architecture = key in architecture_params
 
+                    # For architecture params: always use checkpoint value (ignore CLI)
+                    # For other params: use CLI value if explicitly set, otherwise use checkpoint
+                    if is_architecture:
+                        final_value = loaded_value
+                        if is_cli_override and cli_value != loaded_value:
+                            logger.warning(f"  WARNING: Ignoring CLI override for architecture param '{key}' (checkpoint={loaded_value}, CLI={cli_value})")
+                    else:
+                        if is_cli_override:
+                            final_value = cli_value
+                            if cli_value != loaded_value:
+                                overrides.append(f"{key}: {loaded_value} -> {cli_value}")
+                        else:
+                            final_value = loaded_value
+
+                    # Apply the final value
+                    if key == 'batch_size': batch_size = final_value
+                    elif key == 'sequence_length': sequence_length = final_value
+                    elif key == 'epochs': epochs = final_value
+                    elif key == 'lr': lr = final_value
+                    elif key == 'num_workers': num_workers = final_value
+                    elif key == 'd_model': d_model = final_value
+                    elif key == 'd_code_a': d_code_a = final_value
+                    elif key == 'd_code_h': d_code_h = final_value
+                    elif key == 'codebook_sizes_a':
+                        codebook_sizes_a = final_value
+                        num_lvq_levels_a = len(codebook_sizes_a)
+                    elif key == 'codebook_sizes_h':
+                        codebook_sizes_h = final_value
+                        num_lvq_levels_h = len(codebook_sizes_h)
+                    elif key == 'num_encoder_blocks': num_encoder_blocks = final_value
+                    elif key == 'num_decoder_blocks': num_decoder_blocks = final_value
+                    elif key == 'use_frame_masking': use_frame_masking = final_value
+                    elif key == 'frame_mask_prob': frame_mask_prob = final_value
+                    elif key == 'use_rollout': use_rollout = final_value
+                    elif key == 'rollout_steps': rollout_steps = final_value
+                    elif key == 'rollout_weights': rollout_weights = final_value
+                    elif key == 'val_frequency': val_frequency = final_value
+                    elif key == 'val_size_percent': val_size_percent = final_value
+                    elif key == 'codebook_ema_decay_init': codebook_ema_decay_init = final_value
+                    elif key == 'reinit_dead_codes_interval': reinit_dead_codes_interval = final_value
+                    elif key == 'dead_code_threshold': dead_code_threshold = final_value
+                    elif key == 'use_random_temporal_pe': use_random_temporal_pe = final_value
+                    elif key == 'max_pe_offset': max_pe_offset = final_value
+                    elif key == 'ablate_action': ablate_action = final_value
+                    elif key == 'ablate_world': ablate_world = final_value
+
+            logger.info("\nLoaded configuration from checkpoint")
             if overrides:
-                logger.info("\nCLI Overrides detected:")
+                logger.info("CLI Overrides applied:")
                 for override in overrides:
                     logger.info(f"  {override}")
             else:
-                logger.info("\nNo CLI overrides - using all parameters from checkpoint config")
+                logger.info("No CLI overrides (using all checkpoint values)")
 
             # Store the checkpoint file path for later loading
             resume_from = str(checkpoint_file)
@@ -761,9 +855,13 @@ def train(
         logger.info(f"Loading checkpoint from: {resume_from}")
 
         # Load checkpoint (this reconstructs model and optimizer from saved state)
+        # Pass num_encoder_blocks and num_decoder_blocks from training_config.json
+        # (these may have been loaded from config or specified via CLI override)
         model_loaded, optimizer_loaded, checkpoint_info = load_model(
             checkpoint_path=resume_from,
-            device=device
+            device=device,
+            num_encoder_blocks=num_encoder_blocks,
+            num_decoder_blocks=num_decoder_blocks
         )
 
         # Override model and optimizer with loaded versions
@@ -808,6 +906,9 @@ def train(
         'num_lvq_levels_h': num_lvq_levels_h,
         'codebook_sizes_a': codebook_sizes_a,
         'codebook_sizes_h': codebook_sizes_h,
+        'num_encoder_blocks': num_encoder_blocks,
+        'num_decoder_blocks': num_decoder_blocks,
+        'decay': codebook_ema_decay_init,
         'lr': lr,
         'use_random_temporal_pe': use_random_temporal_pe,
         'max_pe_offset': max_pe_offset,
@@ -846,6 +947,9 @@ def train(
         # Dead code reinitialization
         'reinit_dead_codes_interval': reinit_dead_codes_interval,
         'dead_code_threshold': dead_code_threshold,
+        # Positional embedding
+        'use_random_temporal_pe': use_random_temporal_pe,
+        'max_pe_offset': max_pe_offset,
         # Ablation flags
         'ablate_action': ablate_action,
         'ablate_world': ablate_world,
@@ -1076,9 +1180,9 @@ def train(
                 'world_commit': rvq_losses['world_commit_loss'].item(),
                 'world_codebook': rvq_losses['world_codebook_loss'].item(),
             }
-            # Add rollout losses if enabled
+            # Add diagonal losses if enabled
             for i, r_loss in enumerate(rollout_losses):
-                loss_record[f'rollout_{i+1}'] = r_loss.item()
+                loss_record[f'diagonal_{i}'] = r_loss.item()
 
             epoch_train_losses.append(loss_record)
 
@@ -1096,9 +1200,9 @@ def train(
                     'Train_World_Encoder/codebook_loss': rvq_losses['world_codebook_loss'].item(),
                     'global_step': global_step,
                 }
-                # Add rollout losses if enabled
+                # Add diagonal losses if enabled
                 for i, r_loss in enumerate(rollout_losses):
-                    wandb_log[f'Train_Dynamics_Predictor/rollout_{i+1}'] = r_loss.item()
+                    wandb_log[f'Train_Dynamics_Predictor/diagonal_{i}'] = r_loss.item()
 
                 wandb.log(wandb_log, step=global_step)
 
@@ -1236,9 +1340,9 @@ def train(
                             'world_commit': rvq_losses_val['world_commit_loss'].item(),
                             'world_codebook': rvq_losses_val['world_codebook_loss'].item(),
                         }
-                        # Add rollout losses if enabled
+                        # Add diagonal losses if enabled
                         for i, r_loss in enumerate(rollout_losses_val):
-                            loss_record_val[f'rollout_{i+1}'] = r_loss.item()
+                            loss_record_val[f'diagonal_{i}'] = r_loss.item()
 
                         val_losses.append(loss_record_val)
 
@@ -1418,10 +1522,10 @@ def train(
                     'world_commit': sum(l['world_commit'] for l in val_losses) / len(val_losses),
                     'world_codebook': sum(l['world_codebook'] for l in val_losses) / len(val_losses),
                 }
-                # Add rollout averages if enabled
+                # Add diagonal averages if enabled
                 if use_rollout:
                     for i in range(rollout_steps):
-                        val_avg[f'rollout_{i+1}'] = sum(l[f'rollout_{i+1}'] for l in val_losses) / len(val_losses)
+                        val_avg[f'diagonal_{i}'] = sum(l[f'diagonal_{i}'] for l in val_losses) / len(val_losses)
 
                 # =====================================================================
                 # Compute advanced metrics averages
@@ -1486,7 +1590,7 @@ def train(
                 if use_rollout:
                     log_msg += f", TF: {val_avg['tf_loss']:.6f}"
                     for i in range(rollout_steps):
-                        log_msg += f", Roll{i+1}: {val_avg[f'rollout_{i+1}']:.6f}"
+                        log_msg += f", Diag{i}: {val_avg[f'diagonal_{i}']:.6f}"
                 log_msg += (f", A_Commit: {val_avg['action_commit']:.6f}, A_Code: {val_avg['action_codebook']:.6f}, "
                            f"W_Commit: {val_avg['world_commit']:.6f}, W_Code: {val_avg['world_codebook']:.6f}")
                 logger.info(log_msg)
@@ -1531,10 +1635,10 @@ def train(
                         'Val_World_Encoder/codebook_loss': val_avg['world_codebook'],
                         'epoch': epoch + (batch_idx + 1) / total_batches,  # Fractional epoch
                     }
-                    # Add rollout losses if enabled
+                    # Add diagonal losses if enabled
                     if use_rollout:
                         for i in range(rollout_steps):
-                            wandb_val_log[f'Val_Dynamics_Predictor/rollout_{i+1}'] = val_avg[f'rollout_{i+1}']
+                            wandb_val_log[f'Val_Dynamics_Predictor/diagonal_{i}'] = val_avg[f'diagonal_{i}']
 
                     # Add advanced metrics (Step 6) - convert to percentages
                     # Dynamic logging for all RVQ levels
@@ -1638,14 +1742,14 @@ def train(
         # Add rollout averages if enabled
         if use_rollout:
             for i in range(rollout_steps):
-                train_avg[f'rollout_{i+1}'] = sum(l[f'rollout_{i+1}'] for l in epoch_train_losses) / len(epoch_train_losses)
+                train_avg[f'diagonal_{i}'] = sum(l[f'diagonal_{i}'] for l in epoch_train_losses) / len(epoch_train_losses)
 
         logger.info(f"\nEpoch {epoch + 1} Summary:")
         log_msg_train = f"Train Loss - Total: {train_avg['total']:.6f}, Recon: {train_avg['recon']:.6f}"
         if use_rollout:
             log_msg_train += f", TF: {train_avg['tf_loss']:.6f}"
             for i in range(rollout_steps):
-                log_msg_train += f", Roll{i+1}: {train_avg[f'rollout_{i+1}']:.6f}"
+                log_msg_train += f", Diag{i}: {train_avg[f'diagonal_{i}']:.6f}"
         log_msg_train += (f", A_Commit: {train_avg['action_commit']:.6f}, A_Code: {train_avg['action_codebook']:.6f}, "
                          f"W_Commit: {train_avg['world_commit']:.6f}, W_Code: {train_avg['world_codebook']:.6f}")
         logger.info(log_msg_train)

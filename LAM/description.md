@@ -143,10 +143,37 @@ If we take a matrix $S \in \mathbb R^{K\times T}$ where $K$ is the maximum itera
 
 **Training trick**:
 
-- During the computation of training/val running rollout MSE recon loss, apply a mask from 0 to k-1 (inclusive), for each k iteration rollout. (Note, this is not autoregressive MSE recon loss)
-- Note, we consider the first step of rollout to be the teacher forcing.
+- During the computation of training/val running rollout MSE recon loss.
+- We consider the first step of rollout to be the teacher forcing.
 
+We will have the following matrix:
+$$
+S =
+\begin{bmatrix}
+S_{1,1} & S_{1,2} & S_{1,3} & \cdots & S_{1,T} \\
+S_{2,1} & S_{2,2} & S_{2,3} & \cdots & S_{2,T} \\
+S_{3,1} & S_{3,2} & S_{3,3} & \cdots & S_{3,T} \\
+\vdots  & \vdots  & \vdots  & \ddots & \vdots  \\
+S_{K,1} & S_{K,2} & S_{K,3} & \cdots & S_{K,T}
+\end{bmatrix}
+$$
+The main diagnal: $ D_0 = \{ S_{1,1},\, S_{2,2},\, S_{3,3},\, \dots,\, S_{K,K} \}$ would be equivalent to autoregressive rollout (with one seed ground truth).
 
+And the first superdiagnal: $ D_{+1} = \{ S_{1,2},\, S_{2,3},\, \dots,\, S_{K-1,K} \}$  would be autoregressive rollout given two ground truth initialization.
+
+We compute $L_\text{diag}$ :
+$$
+\mathcal{L}_{\text{diag}} = 
+\frac{1}{Z}
+\sum_{k=1}^{K} 
+w_k \,
+\mathrm{MSE}(S_{k,k},\, GT_{k+1}),
+\quad
+w_k = 1 - \frac{k-1}{K},
+\quad
+Z = \sum_{k=1}^{K} w_k
+$$
+Note, this means we would neglect the lower diagnals, as they simply repeats what's above them.
 
 
 ## Overfit test in `overfit.py`
